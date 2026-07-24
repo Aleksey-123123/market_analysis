@@ -42,6 +42,28 @@ python make_sample.py --rows 4000 --out data/normalized.parquet
 python analyze.py --input data/normalized.parquet --out out/niches.xlsx --group okpd2,region
 ```
 
+## Путь через ГосПлан API (автоматическая выгрузка, без ручных экспортов)
+
+Убирает ручную выгрузку и лимит 2000: скрипт сам ходит по REST постранично.
+Стартуем на **бесплатном тестовом сервере** `v2test.gosplan.info` (без ключа,
+~10 запросов/мин); прод `v2.gosplan.info` (30к/год) включается позже.
+
+```bash
+pip install -r requirements.txt
+# 1) настроить фильтр в config.yaml -> секция gosplan.query (date_from, okpd2, region)
+# 2) посмотреть реальные поля ответа (важно: подтвердить схему):
+python loaders/gosplan_api.py probe --config config.yaml --law 223
+# 3) выкачать (отдельно 223 и 44) и проанализировать:
+python loaders/gosplan_api.py pull --config config.yaml --law 223 --out data/n223.parquet
+python loaders/gosplan_api.py pull --config config.yaml --law 44  --out data/n44.parquet
+python analyze.py --input data/n223.parquet --out out/niches223.xlsx --group okpd2,region
+```
+
+> Пути эндпоинтов и имена параметров ГосПлана заданы в `DEFAULTS`/`config.yaml`
+> как обоснованное предположение. **Сначала запустите `probe`** — он печатает
+> плоские ключи первой записи и текущий маппинг; если что-то мапится не так,
+> поправьте `gosplan.paths` / `gosplan.params` в конфиге (или пришлите вывод).
+
 ## Боевой запуск на данных ЕИС
 
 > Запускать там, где есть доступ к `zakupki.gov.ru` (ваш ПК / VPS в РФ).
@@ -88,6 +110,7 @@ BaseX + XQuery (см. статью в родительском обсужден�
 | `schema.py` | нормализованная схема (контракт между слоями) |
 | `analyze.py` | движок: метрики узких мест + скоринг ниш |
 | `make_sample.py` | генератор синтетики для теста движка |
+| `loaders/gosplan_api.py` | автовыгрузка через ГосПлан API (probe/pull) |
 | `loaders/kontur_csv.py` | нормализация экспорта Контур.Закупки (Excel/CSV) |
 | `loaders/zakupki_ftp.py` | выгрузка+парсинг открытых данных ЕИС (FTP) |
 | `config.yaml` | регионы, каталоги ЕИС, период, целевые ОКПД2 |

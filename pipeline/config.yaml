@@ -17,6 +17,23 @@ sources:
     remote_dir: "/out/published/currMonth"
     max_archives: 30
 
+# --- ГосПлан API (loaders/gosplan_api.py) ------------------------------------
+# Стартуем на бесплатном тестовом сервере (без ключа, ~10 запросов/мин).
+# Порядок: 1) probe -> увидеть реальные поля, 2) при необходимости поправить
+# paths/params, 3) pull -> выкачать. Прод включается use: prod + api_key.
+gosplan:
+  use: test                     # test (бесплатно) | prod (30к/год, ключ с 01.08.2026)
+  api_key: ""                   # только для prod
+  rpm: 10                       # лимит теста: 10 запросов/мин
+  # paths и params переопределяйте ТОЛЬКО если probe покажет, что дефолты не те:
+  # paths: { "44": "/api/v2/44fz/notifications", "223": "/api/v2/223fz/notifications" }
+  # params: { page: page, size: perPage, size_value: 50, date_from: publishDateFrom, ... }
+  query:                        # фильтр выборки (имена значений — человеческие)
+    date_from: "2024-07-01"
+    date_to: "2026-07-01"
+    okpd2: "24.10"              # можно менять под гипотезу
+    region: ""                 # пусто = все регионы
+
 # Фильтры ниш применяются на этапе analyze.py (--group / --min-lots).
 # Целевые ОКПД2-гипотезы (для справки, чтобы отфильтровать после парсинга):
 target_okpd2:
