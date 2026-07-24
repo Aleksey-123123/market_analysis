@@ -141,11 +141,22 @@ def record_to_row(rec: dict) -> dict:
 def fetch_page(session, m, path, params) -> list:
     url = m[f"base_url_{m['use']}"].rstrip("/") + path
     headers = {"Authorization": f"Bearer {m['api_key']}"} if m["use"] == "prod" and m["api_key"] else {}
-    for attempt in range(5):
-        r = session.get(url, params=params, headers=headers, timeout=60)
+    for attempt in range(7):
+        try:
+            r = session.get(url, params=params, headers=headers, timeout=60)
+        except requests.exceptions.RequestException as e:   # обрыв связи/таймаут
+            wait = min(60, 2 ** attempt)
+            print(f"  сеть ({type(e).__name__}) -> ретрай через {wait}с")
+            time.sleep(wait)
+            continue
         if r.status_code == 429:
             print("  429 rate limit -> ждём 60с")
             time.sleep(60)
+            continue
+        if r.status_code >= 500:                            # временная ошибка сервера
+            wait = min(60, 2 ** attempt)
+            print(f"  {r.status_code} сервер -> ретрай через {wait}с")
+            time.sleep(wait)
             continue
         r.raise_for_status()
         data = r.json()
@@ -153,7 +164,7 @@ def fetch_page(session, m, path, params) -> list:
             for part in m["items_path"].split("."):
                 data = data.get(part, []) if isinstance(data, dict) else data
         return data if isinstance(data, list) else data.get("items", data.get("data", []))
-    raise RuntimeError("не удалось получить страницу после ретраев")
+    raise RuntimeError("страница недоступна после ретраев")
 
 
 def _aslist(v):
@@ -290,49 +301,80 @@ def cmd_pull(cfg, law, out):
     skip_max = m["skip_max"]
     size = p["size_value"]
     session = requests.Session()
-
-    # Срезы, чтобы обойти лимит skip<=1000: перебор ОКПД x регион, если заданы списками.
-    src = (cfg.get("gosplan", {}) or {}).get("query", {})
-    classifiers = _aslist(src.get("okpd2")) or [None]
-    regions = _aslist(src.get("region")) or [None]
-
-    by_id: dict = {}
-    for cl in classifiers:
-        for rg in regions:
-            skip, got = 0, 0
-            label = f"ОКПД={cl or 'все'} регион={rg or 'все'}"
-            while True:
-                params = build_params(m, cfg, classifier=cl, region=rg)
-                params[p["skip"]] = skip
-                t0 = time.time()
-                items = fetch_page(session, m, path, params)
-                if not items:
-                    break
-                for x in items:
-                    row = record_to_row(x)
-                    if row.get("purchase_id"):
-                        by_id[row["purchase_id"]] = row
-                got += len(items)
-                skip += size
-                print(f"  [{label}] skip={skip-size}: +{len(items)}  уникальных всего {len(by_id)}")
-                if len(items) < size:
-                    break
-                if skip > skip_max:
-                    print(f"  ! [{label}] упёрлись в лимит skip<={skip_max} (~{got} записей). "
-                          f"Срез не докачан — сузьте даты/добавьте разбивку.")
-                    break
-                time.sleep(max(0, interval - (time.time() - t0)))
-
-    df = pd.DataFrame(list(by_id.values()), columns=COLUMNS)
-    df["fz"] = law
-    df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce").dt.date
     dest = Path(out)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.suffix.lower() in (".parquet", ".pq"):
-        df.to_parquet(dest, index=False)
-    else:
-        df.to_csv(dest, index=False, encoding="utf-8-sig")
-    print(f"\nГотово: {len(df)} записей ({law}-ФЗ) -> {dest}")
+
+    src = (cfg.get("gosplan", {}) or {}).get("query", {})
+    classifiers = _aslist(src.get("okpd2")) or [None]
+    regions_cfg = _aslist(src.get("region"))
+    auto_region = regions_cfg is None          # регион не задан -> добираем срезы по регионам при упоре в лимит
+    regions = regions_cfg or [None]
+
+    by_id: dict = {}
+    # Резюме: если файл уже есть — подхватываем собранное, чтобы не качать заново.
+    if dest.exists():
+        try:
+            prev = pd.read_parquet(dest) if dest.suffix.lower() in (".parquet", ".pq") else pd.read_csv(dest)
+            for rec in prev.to_dict("records"):
+                pid = rec.get("purchase_id")
+                if pid:
+                    by_id[str(pid)] = {c: rec.get(c) for c in COLUMNS}
+            print(f"Резюме: подхватил {len(by_id)} ранее собранных записей из {dest.name}")
+        except Exception as e:  # noqa: BLE001
+            print(f"(резюме пропущено: {e})")
+
+    def save():
+        df = pd.DataFrame(list(by_id.values()), columns=COLUMNS)
+        df["fz"] = law
+        df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce").dt.date
+        if dest.suffix.lower() in (".parquet", ".pq"):
+            df.to_parquet(dest, index=False)
+        else:
+            df.to_csv(dest, index=False, encoding="utf-8-sig")
+        return len(df)
+
+    def pull_slice(cl, rg) -> str:
+        """Качает один срез постранично. Возвращает 'done' | 'truncated' | 'error'."""
+        skip = 0
+        label = f"ОКПД={cl or 'все'} регион={rg if rg is not None else 'все'}"
+        while True:
+            params = build_params(m, cfg, classifier=cl, region=rg)
+            params[p["skip"]] = skip
+            t0 = time.time()
+            try:
+                items = fetch_page(session, m, path, params)
+            except Exception as e:                       # noqa: BLE001
+                print(f"  ! [{label}] срез прерван ({e}) — сохраняю собранное, иду дальше")
+                return "error"
+            if not items:
+                return "done"
+            for x in items:
+                row = record_to_row(x)
+                if row.get("purchase_id"):
+                    by_id[row["purchase_id"]] = row
+            skip += size
+            print(f"  [{label}] skip={skip-size}: +{len(items)}  уникальных всего {len(by_id)}")
+            if len(items) < size:
+                return "done"
+            if skip > skip_max:
+                return "truncated"
+            time.sleep(max(0, interval - (time.time() - t0)))
+
+    try:
+        for cl in classifiers:
+            for rg in regions:
+                status = pull_slice(cl, rg)
+                if status == "truncated" and rg is None and auto_region:
+                    print(f"  -> срез ОКПД={cl} велик, добираю по регионам 1..99")
+                    for r in range(1, 100):
+                        pull_slice(cl, r)
+                        save()          # checkpoint после каждого региона
+                save()                  # checkpoint после каждого среза ОКПД
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем — сохраняю собранное.")
+    finally:
+        n = save()
+        print(f"\nГотово/сохранено: {n} записей ({law}-ФЗ) -> {dest}")
 
 
 def main():
