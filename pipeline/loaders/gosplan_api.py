@@ -284,6 +284,26 @@ def cmd_discover(cfg):
     print("\nПришлите строки со статусом 200 (или все) — по ним найду рабочий путь.")
 
 
+def cmd_detail(cfg, law, regnum):
+    """Показывает поля детального контракта (ищем поставщика)."""
+    m = cfg_get(cfg)
+    base = m["base_url_" + m["use"]].rstrip("/")
+    for suffix in ["", "/contract"]:
+        url = f"{base}/fz{law}/contracts/{regnum}{suffix}"
+        print(f"\n=== GET {url} ===")
+        try:
+            r = requests.get(url, timeout=60)
+            print("HTTP", r.status_code)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            data = j[0] if isinstance(j, list) and j else j
+            for k, v in flatten(data).items():
+                print(f"  {k} = {str(v)[:80]}")
+        except Exception as e:      # noqa: BLE001
+            print("ошибка:", e)
+
+
 def cmd_probe(cfg, law, obj="purchases"):
     m = cfg_get(cfg)
     path = f"/fz{law}/{obj}"
@@ -407,11 +427,12 @@ def cmd_pull(cfg, law, out, obj="purchases"):
 
 def main():
     ap = argparse.ArgumentParser(description="ГосПлан API loader")
-    ap.add_argument("cmd", choices=["discover", "probe", "pull"])
+    ap.add_argument("cmd", choices=["discover", "probe", "detail", "pull"])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--law", default="223", choices=["44", "223"])
     ap.add_argument("--object", default="purchases", choices=["purchases", "contracts"],
-                    help="что качать: извещения (purchases) или контракты с победителем (contracts)")
+                    help="что качать: извещения (purchases) или контракты (contracts)")
+    ap.add_argument("--regnum", default=None, help="reg_num контракта для команды detail")
     ap.add_argument("--out", default="../data/normalized.parquet")
     args = ap.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
@@ -419,6 +440,8 @@ def main():
         cmd_discover(cfg)
     elif args.cmd == "probe":
         cmd_probe(cfg, args.law, args.object)
+    elif args.cmd == "detail":
+        cmd_detail(cfg, args.law, args.regnum)
     else:
         cmd_pull(cfg, args.law, args.out, args.object)
 
