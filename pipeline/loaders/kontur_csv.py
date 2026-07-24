@@ -22,24 +22,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from schema import COLUMNS  # noqa: E402
 
 # Порядок важен: специфичные поля раньше общих (напр. "инн победителя" до "инн").
-# Каждая колонка сопоставляется максимум одному полю.
+# Каждая колонка сопоставляется максимум одному полю. Подстроки учитывают, что
+# в двухуровневой шапке Контура имена вида "Заказчик :: ИНН", "Результат :: ИНН
+# победителя" — квалифицированы группой, что и снимает неоднозначность.
 KANDIDATES: list[tuple[str, list[str]]] = [
-    ("purchase_id",        ["реестровый номер", "номер закупки", "номер извещения", "№ закупки", "номер тендера"]),
-    ("fz",                 ["закон", "тип закупки по фз", "44-фз", "223-фз", " фз"]),
+    ("purchase_id",        ["реестровый номер", "номер закупки", "номер извещения", "№ закупки", "номер тендера", ":: номер", "закупка :: номер"]),
+    ("fz",                 ["тип торгов", "закон", "тип закупки по фз", "44-фз", "223-фз", " фз"]),
     ("publish_date",       ["дата публикац", "дата размещен", "опубликован", "дата начала"]),
     ("okpd2",              ["окпд"]),
     ("region",             ["регион", "субъект"]),
-    ("purchase_method",    ["способ закупки", "способ определения", "способ размещения"]),
+    ("purchase_method",    ["способ отбора", "способ закупки", "способ определения", "способ размещения"]),
     ("nmck",               ["начальная цена", "начальная (макс", "нмц", "цена контракта", "цена договора", "сумма закупки"]),
     ("participants_count", ["количество заявок", "подано заявок", "число участник", "участников"]),
     ("execution_days",     ["срок исполнения", "срок поставки", "срок контракта"]),
+    ("_advance",           ["аванс"]),                               # служебное -> has_advance
     ("winner_inn",         ["инн победителя", "инн поставщика"]),
-    ("winner_name",        ["победитель", "поставщик"]),
-    ("customer_inn",       ["инн заказчика", "инн организатора", "инн"]),
-    ("customer_name",      ["заказчик", "организатор"]),
-    ("_status",            ["статус", "состояние", "результат"]),   # служебное -> флаги
+    ("winner_name",        ["название победителя", "победитель", "поставщик"]),
+    ("customer_inn",       ["инн заказчика", "инн организатора", "заказчик :: инн", "инн"]),
+    ("customer_name",      ["заказчик :: название", "заказчик", "организатор"]),
+    ("_status",            ["этап отбора", "статус", "состояние"]),  # служебное -> флаги failed/canceled
     ("_smp",               ["смп", "мсп", "субъект малого"]),        # служебное -> is_smp
 ]
+
+
+def read_kontur(path: Path, sheet=0) -> pd.DataFrame:
+    """Читает выгрузку Контура, поддерживая двухуровневую шапку.
+
+    Верхняя строка (группы «Закупка/Заказчик/Результат») склеивается с нижней,
+    что различает дубли «Название»/«ИНН». Если шапка одноуровневая — берётся как есть.
+    """
+    if path.suffix.lower() in (".csv", ".tsv"):
+        return pd.read_csv(path, dtype=str, sep=None, engine="python")
+
+    raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=str)
+    r0, r1 = raw.iloc[0], raw.iloc[1]
+    two_row = r0.notna().sum() < r1.notna().sum() and r0.notna().sum() <= len(r0) * 0.5
+    if two_row:
+        groups = r0.ffill()
+        cols = []
+        for g, s in zip(groups, r1):
+            g = "" if pd.isna(g) else str(g).strip()
+            s = "" if pd.isna(s) else str(s).strip()
+            cols.append(f"{g} :: {s}" if g and s else (s or g))
+        data = raw.iloc[2:].copy()
+    else:
+        cols = [("" if pd.isna(c) else str(c).strip()) for c in r0]
+        data = raw.iloc[1:].copy()
+    data.columns = cols
+    return data.reset_index(drop=True)
 
 
 def _to_float(v) -> float | None:
@@ -69,7 +99,7 @@ def resolve_mapping(headers: list[str]) -> dict[str, str]:
     return mapping
 
 
-def normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
+def normalize(df_raw: pd.DataFrame, okpd2_label: str | None = None) -> pd.DataFrame:
     mapping = resolve_mapping(list(df_raw.columns))
     print("Сопоставление колонок:")
     for field, _ in KANDIDATES:
@@ -104,7 +134,18 @@ def normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
         method = out["purchase_method"].astype(str).str.lower()
         out["is_smp"] = method.str.contains("смп|мсп", na=False)
 
-    out["has_advance"] = False  # в стандартной выгрузке Контура обычно нет — правится вручную/из карточки
+    # аванс: колонка заполнена (процент/сумма) => True
+    if "_advance" in mapping:
+        adv = df_raw[mapping["_advance"]].astype(str).str.strip().str.lower()
+        out["has_advance"] = adv.notna() & ~adv.isin(["", "nan", "нет", "0", "0%", "без аванса", "none"])
+    else:
+        out["has_advance"] = False
+
+    # ОКПД2 в выгрузке Контура часто отсутствует (поиск уже отфильтрован по нему).
+    # Проставляем константу-метку, чтобы группировать/различать выгрузки.
+    if okpd2_label and (out["okpd2"].isna().all() or "okpd2" not in mapping):
+        out["okpd2"] = okpd2_label
+
     return out[COLUMNS]
 
 
@@ -113,16 +154,14 @@ def main() -> None:
     ap.add_argument("--input", required=True, help="export.xlsx или export.csv из Контур.Закупки")
     ap.add_argument("--out", default="../data/normalized.parquet")
     ap.add_argument("--sheet", default=0, help="лист Excel (имя или индекс)")
+    ap.add_argument("--okpd2", default=None, help="метка ОКПД2, если её нет в файле (напр. '24.10/24.45')")
     args = ap.parse_args()
 
     p = Path(args.input)
-    if p.suffix.lower() in (".xlsx", ".xls"):
-        df_raw = pd.read_excel(p, sheet_name=args.sheet, dtype=str)
-    else:
-        df_raw = pd.read_csv(p, dtype=str, sep=None, engine="python")
+    df_raw = read_kontur(p, sheet=args.sheet)
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-    out = normalize(df_raw)
+    out = normalize(df_raw, okpd2_label=args.okpd2)
     dest = Path(args.out)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.suffix.lower() in (".parquet", ".pq"):
