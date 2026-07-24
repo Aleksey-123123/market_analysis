@@ -167,6 +167,79 @@ def build_params(m, law, cfg) -> dict:
     return q
 
 
+def cmd_discover(cfg):
+    """Ищет реальные эндпоинты: сперва OpenAPI-спеку, потом перебор вариантов пути."""
+    import re
+    m = cfg_get(cfg)
+    base = m["base_url_" + m["use"]].rstrip("/")
+    s = requests.Session()
+
+    def get(url, **kw):
+        try:
+            r = s.get(url, timeout=40, **kw)
+            return r
+        except Exception as e:  # noqa: BLE001
+            print(f"  [err] {url} -> {e}")
+            return None
+
+    print("=== 1) Ищу OpenAPI-спеку (в ней перечислены все пути) ===")
+    spec_urls = [
+        base + "/openapi.json", base + "/swagger/v1/swagger.json",
+        base + "/swagger.json", base + "/v3/api-docs", base + "/api-docs",
+        base + "/api/v2/openapi.json", base + "/docs/openapi.json",
+        "https://swagger.gosplan.info/swagger-config.json",
+        "https://swagger.gosplan.info/swagger-config",
+    ]
+    found_spec = False
+    for u in spec_urls:
+        r = get(u)
+        if r is None:
+            continue
+        print(f"  {r.status_code}  {u}")
+        if r.status_code == 200:
+            try:
+                j = r.json()
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(j, dict) and j.get("paths"):
+                found_spec = True
+                print("\n  >>> НАЙДЕНА СПЕКА. Доступные пути:")
+                for path, methods in j["paths"].items():
+                    ms = ",".join(k.upper() for k in methods if k in ("get", "post"))
+                    print(f"    {ms:8s} {path}")
+            elif isinstance(j, dict) and j.get("urls"):
+                print("  swagger-config ссылается на спеки:")
+                for it in j["urls"]:
+                    print(f"    {it.get('name')}: {it.get('url')}")
+        time.sleep(1.5)
+    if found_spec:
+        print("\nПришлите список путей выше — я пропишу их в конфиг.")
+        return
+
+    print("\n=== 2) Спека не найдена. Пробую типовые варианты пути напрямую ===")
+    q = build_params(m, "223", cfg)
+    q[m["params"]["page"]] = 1
+    variants = [
+        "/api/v2/223fz/notifications", "/api/223fz/notifications",
+        "/v2/223fz/notifications", "/223fz/notifications",
+        "/api/v2/223fz/notification", "/api/v2/notifications",
+        "/api/v2/purchases", "/api/v2/223/notifications",
+        "/223-fz/notifications", "/api/v2/fz223/notifications",
+        "/api/v2/notice", "/api/v2/223fz/notice",
+    ]
+    for path in variants:
+        r = get(base + path, params=q)
+        if r is None:
+            continue
+        body = (r.text or "")[:120].replace("\n", " ")
+        print(f"  {r.status_code}  {path}   {body}")
+        if r.status_code == 429:
+            print("  (429 — упёрлись в лимит 10/мин, подождите минуту и повторите)")
+            break
+        time.sleep(6.5)   # держим <10 запросов/мин
+    print("\nПришлите строки со статусом 200 (или все) — по ним найду рабочий путь.")
+
+
 def cmd_probe(cfg, law):
     m = cfg_get(cfg)
     path = m["paths"][law]
@@ -218,13 +291,15 @@ def cmd_pull(cfg, law, out):
 
 def main():
     ap = argparse.ArgumentParser(description="ГосПлан API loader")
-    ap.add_argument("cmd", choices=["probe", "pull"])
+    ap.add_argument("cmd", choices=["discover", "probe", "pull"])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--law", default="223", choices=["44", "223"])
     ap.add_argument("--out", default="../data/normalized.parquet")
     args = ap.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
-    if args.cmd == "probe":
+    if args.cmd == "discover":
+        cmd_discover(cfg)
+    elif args.cmd == "probe":
         cmd_probe(cfg, args.law)
     else:
         cmd_pull(cfg, args.law, args.out)
