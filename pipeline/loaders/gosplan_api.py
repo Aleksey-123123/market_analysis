@@ -42,8 +42,8 @@ DEFAULTS = {
     "use": "test",                       # test | prod
     "api_key": "",                       # нужен только для prod
     "rpm": 10,                           # лимит теста: 10 запросов/мин
-    "paths": {"44": "/api/v2/44fz/notifications",
-              "223": "/api/v2/223fz/notifications"},
+    "paths": {"44": "/fz44/purchases",
+              "223": "/fz223/purchases"},
     "params": {                          # имена query-параметров у ГосПлана
         "page": "page",
         "size": "perPage",
