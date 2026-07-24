@@ -53,14 +53,37 @@ def load(path: str) -> pd.DataFrame:
     return df
 
 
-def _hhi(winners: pd.Series) -> float:
-    """Индекс Херфиндаля по долям победителей (0..1). Выше = концентрированнее."""
-    w = winners.dropna()
-    w = w[w.astype(str).str.len() > 0]
-    if len(w) == 0:
-        return np.nan
-    shares = w.value_counts(normalize=True).values
-    return float((shares ** 2).sum())
+def _clean_suppliers(winners: pd.Series, sums=None):
+    """Возвращает (доли по сумме или по числу, серия сумм по поставщику)."""
+    w = winners.astype("string")
+    mask = w.notna() & (w.str.len() > 0)
+    if not mask.any():
+        return None
+    if sums is not None:
+        by = pd.Series(sums[mask].values, index=w[mask].values).groupby(level=0).sum()
+    else:
+        by = w[mask].value_counts()
+    total = by.sum()
+    if total <= 0:
+        return None
+    return by.sort_values(ascending=False) / total
+
+
+def _hhi(winners: pd.Series, sums=None) -> float:
+    """Индекс Херфиндаля по долям поставщиков (0..1). Выше = концентрированнее."""
+    shares = _clean_suppliers(winners, sums)
+    return float((shares.values ** 2).sum()) if shares is not None else np.nan
+
+
+def _crn(winners: pd.Series, n=3, sums=None) -> float:
+    """Доля топ-N поставщиков (CR-N), 0..1. Напр. CR3 > 0.7 = концентрировано."""
+    shares = _clean_suppliers(winners, sums)
+    return float(shares.head(n).sum()) if shares is not None else np.nan
+
+
+def _n_suppliers(winners: pd.Series) -> int:
+    w = winners.astype("string")
+    return int(w[w.notna() & (w.str.len() > 0)].nunique())
 
 
 def analyze(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -87,7 +110,10 @@ def analyze(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
         failed = g["is_failed"].mean()
         canceled = g["is_canceled"].mean()
         dysfunction = float(failed + canceled)
-        hhi = _hhi(g["winner_inn"])
+        # концентрация поставщиков — по сумме контрактов (nmck), где есть победитель
+        hhi = _hhi(g["winner_inn"], g["nmck"])
+        cr3 = _crn(g["winner_inn"], 3, g["nmck"])
+        n_suppliers = _n_suppliers(g["winner_inn"])
         # повторяемость: доля закупок, приходящихся на заказчиков-повторников
         cust_counts = g["customer_inn"].value_counts()
         repeat_customers = int((cust_counts >= 3).sum())
@@ -107,6 +133,8 @@ def analyze(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
             "canceled_share": float(canceled),
             "dysfunction": dysfunction,
             "winner_hhi": hhi,
+            "cr3": cr3,
+            "n_suppliers": n_suppliers,
             "repeat_customers": repeat_customers,
             "repeatability": repeatability,
             "smp_share": float(g["is_smp"].mean()),
@@ -164,8 +192,8 @@ def main() -> None:
         print(f"Связок отобрано: {len(res)}  |  файл: {out}\n")
         print("ТОП-10 ниш по opportunity_score:")
         cols = group_cols + ["lots_count", "total_sum", "growth",
-                             "no_competition_share", "dysfunction",
-                             "winner_hhi", "opportunity_score"]
+                             "n_suppliers", "cr3", "winner_hhi", "dysfunction",
+                             "opportunity_score"]
         print(res[cols].head(10).to_string(index=False))
 
 

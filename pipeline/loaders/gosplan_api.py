@@ -61,7 +61,7 @@ DEFAULTS = {
 # Точный маппинг под схему ГосПлана /fzNNN/purchases и /fzNNN/contracts.
 # "a+b" => ключ должен содержать И "a", И "b". Порядок: специфичное раньше общего.
 KEY_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("purchase_id",        ["purchase_number", "reg_num", "registration_number"]),
+    ("purchase_id",        ["reg_num", "registration_number", "purchase_number"]),
     ("publish_date",       ["published_at", "publish_date"]),
     ("okpd2",              ["okpd2"]),
     ("region",             ["region"]),
@@ -284,9 +284,9 @@ def cmd_discover(cfg):
     print("\nПришлите строки со статусом 200 (или все) — по ним найду рабочий путь.")
 
 
-def cmd_probe(cfg, law):
+def cmd_probe(cfg, law, obj="purchases"):
     m = cfg_get(cfg)
-    path = m["paths"][law]
+    path = f"/fz{law}/{obj}"
     params = build_params(m, cfg)
     params[m["params"]["limit"]] = 5
     params[m["params"]["skip"]] = 0
@@ -310,9 +310,9 @@ def cmd_probe(cfg, law):
         print(json.dumps(record_to_row(items[0]), ensure_ascii=False, indent=2, default=str))
 
 
-def cmd_pull(cfg, law, out):
+def cmd_pull(cfg, law, out, obj="purchases"):
     m = cfg_get(cfg)
-    path = m["paths"][law]
+    path = f"/fz{law}/{obj}"
     p = m["params"]
     interval = 60.0 / max(1, m["rpm"])
     skip_max = m["skip_max"]
@@ -410,15 +410,17 @@ def main():
     ap.add_argument("cmd", choices=["discover", "probe", "pull"])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--law", default="223", choices=["44", "223"])
+    ap.add_argument("--object", default="purchases", choices=["purchases", "contracts"],
+                    help="что качать: извещения (purchases) или контракты с победителем (contracts)")
     ap.add_argument("--out", default="../data/normalized.parquet")
     args = ap.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     if args.cmd == "discover":
         cmd_discover(cfg)
     elif args.cmd == "probe":
-        cmd_probe(cfg, args.law)
+        cmd_probe(cfg, args.law, args.object)
     else:
-        cmd_pull(cfg, args.law, args.out)
+        cmd_pull(cfg, args.law, args.out, args.object)
 
 
 if __name__ == "__main__":
