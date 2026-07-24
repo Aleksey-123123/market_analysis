@@ -58,21 +58,22 @@ DEFAULTS = {
     "items_path": "",                    # где в JSON список; "" = корень-массив / авто items|data
 }
 
-# Толерантный маппинг: "a+b" => ключ должен содержать И "a", И "b".
+# Точный маппинг под схему ГосПлана /fzNNN/purchases и /fzNNN/contracts.
+# "a+b" => ключ должен содержать И "a", И "b". Порядок: специфичное раньше общего.
 KEY_CANDIDATES: list[tuple[str, list[str]]] = [
-    ("purchase_id",        ["purchasenumber", "registrationnumber", "regnumber", "notificationnumber", "noticenumber", "number"]),
-    ("publish_date",       ["publishdate", "datepublished", "publisheddate", "createdate"]),
-    ("okpd2",              ["okpd2", "okpd"]),
-    ("region",             ["region", "subject"]),
-    ("purchase_method",    ["placingway", "determination", "method", "purchasemethod"]),
-    ("nmck",               ["maxprice", "startprice", "startmaxprice", "contractprice", "nmck", "price", "sum"]),
-    ("participants_count", ["participantscount", "applicationscount", "bidscount", "offerscount", "participant"]),
-    ("execution_days",     ["executionterm", "deliveryterm", "term"]),
-    ("winner_inn",         ["winner+inn", "supplier+inn", "winnerinn"]),
-    ("winner_name",        ["winner+name", "supplier+name", "winner+fullname"]),
-    ("customer_inn",       ["customer+inn", "customerinn", "inn"]),
-    ("customer_name",      ["customer+name", "customer+fullname", "customername"]),
-    ("_status",            ["status", "stage", "state"]),
+    ("purchase_id",        ["purchase_number", "reg_num", "registration_number"]),
+    ("publish_date",       ["published_at", "publish_date"]),
+    ("okpd2",              ["okpd2"]),
+    ("region",             ["region"]),
+    ("nmck",               ["max_price", "contract_price", "price"]),
+    ("purchase_method",    ["purchase_type"]),
+    # победитель/поставщик и участники есть в /contracts и протоколах (в /purchases их нет):
+    ("winner_inn",         ["supplier+inn", "winner+inn", "supplier_inn", "supplier"]),
+    ("winner_name",        ["supplier+name", "winner+name"]),
+    ("participants_count", ["participants_count", "applications_count", "bids_count", "offers_count"]),
+    ("execution_days",     ["execution_term", "delivery_term"]),
+    ("customer_inn",       ["customer"]),          # в purchases customer = ИНН заказчика
+    ("_stage",             ["stage"]),             # 1..4 стадия
 ]
 
 
@@ -119,11 +120,13 @@ def record_to_row(rec: dict) -> dict:
         key = _match(flat, used, cands)
         if key is not None:
             row[field if not field.startswith("_") else field] = flat[key]
-    # флаги из статуса
-    status = str(row.pop("_status", "") or "").lower().replace(" ", "")
-    row["is_failed"] = ("несостоя" in status) or ("failed" in status) or ("notplaced" in status)
-    row["is_canceled"] = ("отмен" in status) or ("cancel" in status)
-    row["is_smp"] = ("смп" in status) or ("мсп" in status)
+    # СМП — из кода способа закупки (напр. purchaseNoticeZKESMBO -> ...SMBO)
+    method = str(row.get("purchase_method") or "").lower()
+    row["is_smp"] = any(s in method for s in ("smbo", "smsp", "смп", "мсп"))
+    # стадия закупки (ГосПлан): 4 -> отменена. Остальные коды уточняем по данным.
+    stage = str(row.pop("_stage", "") or "").strip()
+    row["is_canceled"] = stage == "4"
+    row["is_failed"] = False        # «несостоявшаяся» берём из протоколов/контрактов (доп. слой)
     row["has_advance"] = None
     # типы
     try:
