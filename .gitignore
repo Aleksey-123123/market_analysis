@@ -1,0 +1,6 @@
+# Generated / downloaded data — не коммитим
+pipeline/data/
+pipeline/out/
+__pycache__/
+*.pyc
+.venv/
