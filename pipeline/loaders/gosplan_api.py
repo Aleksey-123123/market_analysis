@@ -44,17 +44,18 @@ DEFAULTS = {
     "rpm": 10,                           # лимит теста: 10 запросов/мин
     "paths": {"44": "/fz44/purchases",
               "223": "/fz223/purchases"},
-    "params": {                          # имена query-параметров у ГосПлана
-        "page": "page",
-        "size": "perPage",
-        "size_value": 50,
-        "date_from": "publishDateFrom",
-        "date_to": "publishDateTo",
-        "okpd2": "okpd2",
-        "region": "region",
+    "params": {                          # реальные query-параметры ГосПлана (openapi.json)
+        "limit": "limit",                # размер страницы (макс 100)
+        "skip": "skip",                  # смещение (макс 1000 -> ~1100 записей на срез!)
+        "size_value": 100,
+        "date_from": "published_after",
+        "date_to": "published_before",
+        "okpd2": "classifier",           # массив кодов ОКПД2
+        "region": "region",              # массив кодов регионов (1..99)
+        "stage": "stage",                # массив стадий ("1".."4")
     },
-    "start_page": 1,
-    "items_path": "",                    # где в JSON лежит список (напр. "data" / "items"); "" = корень-массив
+    "skip_max": 1000,                    # ограничение API на смещение
+    "items_path": "",                    # где в JSON список; "" = корень-массив / авто items|data
 }
 
 # Толерантный маппинг: "a+b" => ключ должен содержать И "a", И "b".
@@ -152,18 +153,30 @@ def fetch_page(session, m, path, params) -> list:
     raise RuntimeError("не удалось получить страницу после ретраев")
 
 
-def build_params(m, law, cfg) -> dict:
+def _aslist(v):
+    if v in (None, "", []):
+        return None
+    return v if isinstance(v, list) else [v]
+
+
+def build_params(m, cfg, classifier=None, region=None) -> dict:
+    """Базовый фильтр (без skip). classifier/region — переопределение среза."""
     p = m["params"]
     src = (cfg.get("gosplan", {}) or {}).get("query", {})
-    q = {p["size"]: p["size_value"]}
+    q = {p["limit"]: p["size_value"]}
     if src.get("date_from"):
         q[p["date_from"]] = src["date_from"]
     if src.get("date_to"):
         q[p["date_to"]] = src["date_to"]
-    if src.get("okpd2"):
-        q[p["okpd2"]] = src["okpd2"]
-    if src.get("region"):
-        q[p["region"]] = src["region"]
+    ok = _aslist(classifier if classifier is not None else src.get("okpd2"))
+    if ok:
+        q[p["okpd2"]] = ok
+    reg = _aslist(region if region is not None else src.get("region"))
+    if reg:
+        q[p["region"]] = reg
+    st = _aslist(src.get("stage"))
+    if st:
+        q[p["stage"]] = st
     return q
 
 
@@ -217,8 +230,8 @@ def cmd_discover(cfg):
         return
 
     print("\n=== 2) Спека не найдена. Пробую типовые варианты пути напрямую ===")
-    q = build_params(m, "223", cfg)
-    q[m["params"]["page"]] = 1
+    q = build_params(m, cfg)
+    q[m["params"]["skip"]] = 0
     variants = [
         "/api/v2/223fz/notifications", "/api/223fz/notifications",
         "/v2/223fz/notifications", "/223fz/notifications",
@@ -243,16 +256,25 @@ def cmd_discover(cfg):
 def cmd_probe(cfg, law):
     m = cfg_get(cfg)
     path = m["paths"][law]
-    params = build_params(m, law, cfg)
-    params[m["params"]["page"]] = m["start_page"]
+    params = build_params(m, cfg)
+    params[m["params"]["limit"]] = 5
+    params[m["params"]["skip"]] = 0
     base = m["base_url_" + m["use"]]
     print("GET {}{}\n  params={}\n".format(base, path, params))
-    items = fetch_page(requests.Session(), m, path, params)
-    print(f"Получено записей на странице: {len(items)}")
+
+    url = base.rstrip("/") + path
+    r = requests.get(url, params=params, timeout=60)
+    print("HTTP", r.status_code)
+    r.raise_for_status()
+    raw = r.json()
+    print("Тип ответа:", type(raw).__name__,
+          ("| ключи-обёртки: " + ", ".join(list(raw.keys())[:10])) if isinstance(raw, dict) else "")
+    items = raw if isinstance(raw, list) else raw.get("items", raw.get("data", []))
+    print(f"Записей на странице: {len(items)}")
     if items:
-        print("\n--- ПЛОСКИЕ КЛЮЧИ первой записи (пришлите мне для маппинга) ---")
+        print("\n--- ПЛОСКИЕ КЛЮЧИ первой записи (пришлите мне это) ---")
         for k, v in flatten(items[0]).items():
-            print(f"  {k} = {str(v)[:60]}")
+            print(f"  {k} = {str(v)[:70]}")
         print("\n--- КАК СЕЙЧАС МАПИТСЯ ---")
         print(json.dumps(record_to_row(items[0]), ensure_ascii=False, indent=2, default=str))
 
@@ -260,24 +282,45 @@ def cmd_probe(cfg, law):
 def cmd_pull(cfg, law, out):
     m = cfg_get(cfg)
     path = m["paths"][law]
+    p = m["params"]
     interval = 60.0 / max(1, m["rpm"])
+    skip_max = m["skip_max"]
+    size = p["size_value"]
     session = requests.Session()
-    rows, page = [], m["start_page"]
-    while True:
-        params = build_params(m, law, cfg)
-        params[m["params"]["page"]] = page
-        t0 = time.time()
-        items = fetch_page(session, m, path, params)
-        if not items:
-            break
-        rows.extend(record_to_row(x) for x in items)
-        print(f"  стр.{page}: +{len(items)}  всего {len(rows)}")
-        page += 1
-        if len(items) < m["params"]["size_value"]:
-            break
-        time.sleep(max(0, interval - (time.time() - t0)))   # соблюдаем rpm
 
-    df = pd.DataFrame(rows, columns=COLUMNS)
+    # Срезы, чтобы обойти лимит skip<=1000: перебор ОКПД x регион, если заданы списками.
+    src = (cfg.get("gosplan", {}) or {}).get("query", {})
+    classifiers = _aslist(src.get("okpd2")) or [None]
+    regions = _aslist(src.get("region")) or [None]
+
+    by_id: dict = {}
+    for cl in classifiers:
+        for rg in regions:
+            skip, got = 0, 0
+            label = f"ОКПД={cl or 'все'} регион={rg or 'все'}"
+            while True:
+                params = build_params(m, cfg, classifier=cl, region=rg)
+                params[p["skip"]] = skip
+                t0 = time.time()
+                items = fetch_page(session, m, path, params)
+                if not items:
+                    break
+                for x in items:
+                    row = record_to_row(x)
+                    if row.get("purchase_id"):
+                        by_id[row["purchase_id"]] = row
+                got += len(items)
+                skip += size
+                print(f"  [{label}] skip={skip-size}: +{len(items)}  уникальных всего {len(by_id)}")
+                if len(items) < size:
+                    break
+                if skip > skip_max:
+                    print(f"  ! [{label}] упёрлись в лимит skip<={skip_max} (~{got} записей). "
+                          f"Срез не докачан — сузьте даты/добавьте разбивку.")
+                    break
+                time.sleep(max(0, interval - (time.time() - t0)))
+
+    df = pd.DataFrame(list(by_id.values()), columns=COLUMNS)
     df["fz"] = law
     df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce").dt.date
     dest = Path(out)

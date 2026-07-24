@@ -25,14 +25,15 @@ gosplan:
   use: test                     # test (бесплатно) | prod (30к/год, ключ с 01.08.2026)
   api_key: ""                   # только для prod
   rpm: 10                       # лимит теста: 10 запросов/мин
-  # paths и params переопределяйте ТОЛЬКО если probe покажет, что дефолты не те:
-  # paths: { "44": "/api/v2/44fz/notifications", "223": "/api/v2/223fz/notifications" }
-  # params: { page: page, size: perPage, size_value: 50, date_from: publishDateFrom, ... }
-  query:                        # фильтр выборки (имена значений — человеческие)
-    date_from: "2024-07-01"
-    date_to: "2026-07-01"
-    okpd2: "24.10"              # можно менять под гипотезу
-    region: ""                 # пусто = все регионы
+  # Реальные пути и параметры (из openapi.json): /fz223/purchases, /fz44/purchases;
+  # пагинация limit/skip (skip<=1000), даты published_after/before, ОКПД classifier[],
+  # регион region[] (числа 1..99), стадии stage[] ("1".."4").
+  query:                        # фильтр выборки
+    date_from: "2024-07-01"     # published_after
+    date_to: "2026-07-01"       # published_before
+    okpd2: ["24.10", "24.45"]   # classifier[]; список = pull переберёт срезами
+    region: ""                 # напр. [77, 50] ; пусто = все регионы
+    stage: ""                  # напр. ["3","4"] завершённые/отменённые ; пусто = все
 
 # Фильтры ниш применяются на этапе analyze.py (--group / --min-lots).
 # Целевые ОКПД2-гипотезы (для справки, чтобы отфильтровать после парсинга):
