@@ -173,15 +173,32 @@ def _aslist(v):
     return v if isinstance(v, list) else [v]
 
 
-def build_params(m, cfg, classifier=None, region=None) -> dict:
-    """Базовый фильтр (без skip). classifier/region — переопределение среза."""
+def month_windows(date_from: str, date_to: str):
+    """Разбивает [date_from, date_to] на помесячные окна (для нарезки по времени)."""
+    import datetime as dt
+    start = dt.date.fromisoformat(date_from)
+    end = dt.date.fromisoformat(date_to)
+    cur = start.replace(day=1)
+    out = []
+    while cur <= end:
+        nxt = cur.replace(year=cur.year + 1, month=1) if cur.month == 12 \
+            else cur.replace(month=cur.month + 1)
+        out.append((max(cur, start).isoformat(), min(nxt - dt.timedelta(days=1), end).isoformat()))
+        cur = nxt
+    return out
+
+
+def build_params(m, cfg, classifier=None, region=None, date_from=None, date_to=None) -> dict:
+    """Базовый фильтр (без skip). classifier/region/даты — переопределение среза."""
     p = m["params"]
     src = (cfg.get("gosplan", {}) or {}).get("query", {})
     q = {p["limit"]: p["size_value"]}
-    if src.get("date_from"):
-        q[p["date_from"]] = src["date_from"]
-    if src.get("date_to"):
-        q[p["date_to"]] = src["date_to"]
+    df_ = date_from if date_from is not None else src.get("date_from")
+    dt_ = date_to if date_to is not None else src.get("date_to")
+    if df_:
+        q[p["date_from"]] = df_
+    if dt_:
+        q[p["date_to"]] = dt_
     ok = _aslist(classifier if classifier is not None else src.get("okpd2"))
     if ok:
         q[p["okpd2"]] = ok
@@ -333,12 +350,12 @@ def cmd_pull(cfg, law, out):
             df.to_csv(dest, index=False, encoding="utf-8-sig")
         return len(df)
 
-    def pull_slice(cl, rg) -> str:
+    def pull_slice(cl, rg, d_from, d_to) -> str:
         """Качает один срез постранично. Возвращает 'done' | 'truncated' | 'error'."""
         skip = 0
-        label = f"ОКПД={cl or 'все'} регион={rg if rg is not None else 'все'}"
+        label = f"ОКПД={cl or 'все'} рег={rg if rg is not None else 'все'} {d_from or ''}..{d_to or ''}"
         while True:
-            params = build_params(m, cfg, classifier=cl, region=rg)
+            params = build_params(m, cfg, classifier=cl, region=rg, date_from=d_from, date_to=d_to)
             params[p["skip"]] = skip
             t0 = time.time()
             try:
@@ -353,23 +370,34 @@ def cmd_pull(cfg, law, out):
                 if row.get("purchase_id"):
                     by_id[row["purchase_id"]] = row
             skip += size
-            print(f"  [{label}] skip={skip-size}: +{len(items)}  уникальных всего {len(by_id)}")
+            print(f"  [{label}] skip={skip-size}: +{len(items)}  всего {len(by_id)}")
             if len(items) < size:
                 return "done"
             if skip > skip_max:
                 return "truncated"
             time.sleep(max(0, interval - (time.time() - t0)))
 
+    full_from = src.get("date_from")
+    full_to = src.get("date_to")
+    months = month_windows(full_from, full_to) if (full_from and full_to) else [(full_from, full_to)]
+
     try:
         for cl in classifiers:
             for rg in regions:
-                status = pull_slice(cl, rg)
-                if status == "truncated" and rg is None and auto_region:
-                    print(f"  -> срез ОКПД={cl} велик, добираю по регионам 1..99")
-                    for r in range(1, 100):
-                        pull_slice(cl, r)
-                        save()          # checkpoint после каждого региона
-                save()                  # checkpoint после каждого среза ОКПД
+                # 1) пробуем ОКПД целиком за весь период
+                status = pull_slice(cl, rg, full_from, full_to)
+                save()
+                # 2) упёрлись в лимит -> режем по месяцам (полнота по времени, без перекоса)
+                if status == "truncated":
+                    print(f"  -> ОКПД={cl} рег={rg if rg is not None else 'все'} велик: режу по месяцам")
+                    for d_from, d_to in months:
+                        mst = pull_slice(cl, rg, d_from, d_to)
+                        # 3) месяц всё равно велик и регион не задан -> добираем по регионам
+                        if mst == "truncated" and rg is None and auto_region:
+                            print(f"     -> {d_from}..{d_to} велик: добираю по регионам 1..99")
+                            for r in range(1, 100):
+                                pull_slice(cl, r, d_from, d_to)
+                        save()
     except KeyboardInterrupt:
         print("\nПрервано пользователем — сохраняю собранное.")
     finally:
