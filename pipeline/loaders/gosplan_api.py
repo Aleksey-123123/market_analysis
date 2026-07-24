@@ -138,6 +138,29 @@ def record_to_row(rec: dict) -> dict:
     return {c: row.get(c) for c in COLUMNS}
 
 
+def resilient_get(url, params=None, tries=6):
+    """GET с повторами на обрыв связи/429/5xx. Возвращает Response или None."""
+    for a in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+        except requests.exceptions.RequestException as e:
+            wait = min(30, 2 ** a)
+            print(f"  сеть ({type(e).__name__}) -> ретрай через {wait}с")
+            time.sleep(wait)
+            continue
+        if r.status_code == 429:
+            print("  429 -> ждём 60с")
+            time.sleep(60)
+            continue
+        if r.status_code >= 500:
+            wait = min(30, 2 ** a)
+            print(f"  {r.status_code} сервер -> ретрай через {wait}с")
+            time.sleep(wait)
+            continue
+        return r
+    return None
+
+
 def fetch_page(session, m, path, params) -> list:
     url = m[f"base_url_{m['use']}"].rstrip("/") + path
     headers = {"Authorization": f"Bearer {m['api_key']}"} if m["use"] == "prod" and m["api_key"] else {}
@@ -291,17 +314,20 @@ def cmd_detail(cfg, law, regnum):
     for suffix in ["", "/contract"]:
         url = f"{base}/fz{law}/contracts/{regnum}{suffix}"
         print(f"\n=== GET {url} ===")
+        r = resilient_get(url)
+        if r is None:
+            print("нет ответа после повторов")
+            continue
+        print("HTTP", r.status_code)
+        if r.status_code != 200:
+            continue
         try:
-            r = requests.get(url, timeout=60)
-            print("HTTP", r.status_code)
-            if r.status_code != 200:
-                continue
             j = r.json()
             data = j[0] if isinstance(j, list) and j else j
             for k, v in flatten(data).items():
                 print(f"  {k} = {str(v)[:80]}")
         except Exception as e:      # noqa: BLE001
-            print("ошибка:", e)
+            print("ошибка разбора:", e)
 
 
 def cmd_probe(cfg, law, obj="purchases"):
@@ -314,9 +340,14 @@ def cmd_probe(cfg, law, obj="purchases"):
     print("GET {}{}\n  params={}\n".format(base, path, params))
 
     url = base.rstrip("/") + path
-    r = requests.get(url, params=params, timeout=60)
+    r = resilient_get(url, params=params)
+    if r is None:
+        print("Не удалось получить ответ после повторов (сервер рвёт связь). Повторите команду.")
+        return
     print("HTTP", r.status_code)
-    r.raise_for_status()
+    if r.status_code != 200:
+        print("Тело ответа:", (r.text or "")[:400])
+        return
     raw = r.json()
     print("Тип ответа:", type(raw).__name__,
           ("| ключи-обёртки: " + ", ".join(list(raw.keys())[:10])) if isinstance(raw, dict) else "")
