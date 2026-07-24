@@ -430,8 +430,9 @@ def main():
     ap.add_argument("cmd", choices=["discover", "probe", "detail", "pull"])
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--law", default="223", choices=["44", "223"])
-    ap.add_argument("--object", default="purchases", choices=["purchases", "contracts"],
-                    help="что качать: извещения (purchases) или контракты (contracts)")
+    ap.add_argument("--object", default="purchases",
+                    choices=["purchases", "contracts", "procedures"],
+                    help="что качать: purchases | contracts | procedures (участники/снижение, 44-ФЗ)")
     ap.add_argument("--regnum", default=None, help="reg_num контракта для команды detail")
     ap.add_argument("--out", default="../data/normalized.parquet")
     args = ap.parse_args()
