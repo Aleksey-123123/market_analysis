@@ -1,6 +1,6 @@
 """Анализ итогов закупок из рабочей таблицы (колонки K — контракт, L — итог).
 
-Запуск: python analyze_contracts.py путь/к/таблице.xlsx [out.xlsx]
+Запуск: python analyze_contracts.py путь/к/таблице.(xlsx|csv) [out.xlsx]
 """
 import re
 import sys
@@ -89,13 +89,13 @@ def parse_price(v):
 
 
 REGIONS = [
-    ('Москва и МО', r'моск|моспроект|басманн|таганск|кубинк|видное|\bистр|лобн|власих|павлово-посад|рузск|шаховск|дубна|загорск|новогирее|мосводоканал|ТЭЦ № 22|сергиево'),
+    ('Москва и МО', r'моск|моспроект|зарайск|серпухов|балаших|долгопрудн|красногорск|луховиц|люберц|талдом|егорьевск|дмитров|одинцов|басманн|таганск|кубинк|видное|\bистр|лобн|власих|павлово-посад|рузск|шаховск|дубна|загорск|новогирее|мосводоканал|ТЭЦ № 22|сергиево'),
     ('Республика Алтай', r'республик\w* алтай|горно-алтай|усть-кокс|манжерок|белуха|чойск|каракокш'),
     ('Алтайский край', r'алтайск|барнаул|бийск|белокурих|поспелих|волчих|солонеш|быканов'),
     ('Кемеровская обл. (Кузбасс)', r'кузбас|кемеров|анжеро|новокузнец|таштагол|топки|юрг|ленинск-кузнец|евраз|колыван|кузнецк'),
     ('Томская обл.', r'томск'),
     ('Иркутская обл. / Бурятия / Забайкалье', r'иркут|бурят|байкал|нижнеудинск|култук|забайкал|вилюй|таксимо|тулун'),
-    ('Красноярский край / Хакасия / Тыва', r'краснояр|хакас|крамз|норильск|хам-сыр|тыва'),
+    ('Красноярский край / Хакасия / Тыва', r'краснояр|балахт|хакас|крамз|норильск|хам-сыр|тыва'),
     ('Новосибирская обл.', r'новосибирс|бердск|кольцово|искитим|ордынск|татарск|черепанов|кочков|кыштов|чанов|болотн|каргат|доволен|сузун|толмачев|криводанов|бибиха|станционно|здвинск|усть-таркск|куйбышев|ГорМост|гормост|ЦОДД|СО РАН|сибирское отделение|НГУ|СГУТИ|РЭС|электрические сети|брусника|сибагро|стрелочн|сибгазмаш|дубльгис|тепличный комбинат|метрополитен|верх-мильтюш|морского сельсовета|кубовин|промышленно-логистическ|ПЛП'),
     ('Омская обл.', r'омск'),
     ('Прочие регионы', r'усть-балык|смоленщин|краснодар|нижегород|РНЦХ|хирургии|курск'),
@@ -104,7 +104,7 @@ REGIONS = [
 
 def region_of(row):
     # сначала по заказчику, затем по тексту закупки
-    for text in (str(row['cust']), str(row['name'])):
+    for text in (str(row['cust']), str(row.get('addr') or ''), str(row['name'])):
         for reg, pat in REGIONS:
             if re.search(pat, text, flags=re.I):
                 return reg
@@ -158,6 +158,11 @@ def customer_of(c):
 
 
 def law_of(row):
+    t = str(row.get('ptype') or '')
+    if t.startswith('44'):
+        return '44-ФЗ'
+    if t.startswith('223') or t.lower().startswith('коммерч'):
+        return '223-ФЗ / коммерческие'
     url = f"{row['gov']} {row['kontur']}"
     m = re.search(r'(?:regNumber=|searchString=|kontur\.ru/)(\d+)', url)
     if m:
@@ -175,9 +180,22 @@ def clean_winner(w):
     return w.title() if w.isupper() or w.islower() else w
 
 
+HEADERS = {
+    'date': '`', 'tag': 'метка', 'name': 'наименование', 'cust': 'заказчик',
+    'price': 'цена контракта', 'adv': 'аванс', 'deadline': 'дата и время окончания подачи заявок',
+    'term': 'срок исполнения контракта', 'gov': 'закупки гов', 'kontur': 'контур',
+    'ptype': 'тип закупки', 'addr': 'адрес', 'K': 'контракт', 'L': 'причина / сумма контракта',
+}
+
+
 def load(path):
-    df = pd.read_excel(path, header=0).iloc[:, :12]
-    df.columns = COLS
+    if str(path).lower().endswith('.csv'):
+        raw = pd.read_csv(path, dtype=str)
+    else:
+        raw = pd.read_excel(path, header=0)
+    cols = {str(c).strip().lower(): c for c in raw.columns}
+    df = pd.DataFrame({k: raw[cols[h]] if h in cols else None for k, h in HEADERS.items()})
+    df['deadline'] = pd.to_datetime(df.deadline, dayfirst=True, errors='coerce')
     df = df.dropna(subset=['name'])
     df['status'] = df.K.map(norm_status)
     parsed = [parse_L(v, s) for v, s in zip(df.L, df.status)]
@@ -214,12 +232,36 @@ def summary(df, by):
     return out.round(1).sort_values('всего закупок', ascending=False)
 
 
+def open_tenders(df, today):
+    """Открытые тендеры + история по заказчику и по связке направление×регион."""
+    hist = df[df.status.isin(['заключен', 'не состоялась'])]
+
+    def stats(g):
+        if g.empty:
+            return pd.Series({'изв': 0, 'не сост., %': None, 'мед. снижение, %': None})
+        z = g[g.status == 'заключен'].drop_pct
+        return pd.Series({'изв': len(g),
+                          'не сост., %': round(100 * (g.status == 'не состоялась').mean()),
+                          'мед. снижение, %': round(z.median(), 1) if z.notna().any() else None})
+
+    o = df[df.deadline >= today].copy()
+    rows = []
+    for _, r in o.iterrows():
+        c = stats(hist[hist.customer == r.customer]).add_prefix('заказчик: ')
+        s = stats(hist[(hist.direction == r.direction) & (hist.region == r.region)]).add_prefix('сегмент: ')
+        rows.append(pd.concat([c, s]))
+    o = pd.concat([o.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+    cols = ['deadline', 'name', 'customer', 'region', 'direction', 'law', 'nmck', 'adv'] + \
+        [c for c in o.columns if c.startswith(('заказчик: ', 'сегмент: '))] + ['gov']
+    return o[cols].sort_values('deadline')
+
+
 def main():
     src = sys.argv[1]
     dst = sys.argv[2] if len(sys.argv) > 2 else 'contracts_analysis.xlsx'
     df = load(src)
     with pd.ExcelWriter(dst) as xw:
-        cols = ['date', 'name', 'customer', 'region', 'direction', 'law', 'nmck', 'size',
+        cols = ['date', 'deadline', 'name', 'customer', 'region', 'direction', 'law', 'nmck', 'size',
                 'status', 'drop_pct', 'winner', 'fail_reason', 'K', 'L', 'gov']
         df[cols].to_excel(xw, sheet_name='данные', index=False)
         summary(df, 'status').to_excel(xw, sheet_name='итоги')
@@ -237,6 +279,8 @@ def main():
             направления=('direction', lambda s: ', '.join(sorted(set(s)))),
             НМЦК_млн=('nmck', lambda s: round(s.sum() / 1e6, 1)),
         ).sort_values(['побед', 'единственный_участник'], ascending=False).to_excel(xw, sheet_name='победители')
+        open_tenders(df, pd.Timestamp.today().normalize()).to_excel(
+            xw, sheet_name='открытые тендеры', index=False)
         df[df.status == 'не состоялась'][['name', 'customer', 'region', 'direction', 'nmck', 'fail_reason', 'L', 'gov']] \
             .sort_values('nmck', ascending=False).to_excel(xw, sheet_name='несостоявшиеся', index=False)
     return df
