@@ -192,8 +192,11 @@ def load(path):
     if str(path).lower().endswith('.csv'):
         raw = pd.read_csv(path, dtype=str)
     else:
-        raw = pd.read_excel(path, header=0)
+        sheets = pd.ExcelFile(path).sheet_names
+        raw = pd.read_excel(path, header=0, sheet_name='Тендеры' if 'Тендеры' in sheets else 0)
     cols = {str(c).strip().lower(): c for c in raw.columns}
+    if 'статус' in cols:
+        return load_template(raw, cols)
     df = pd.DataFrame({k: raw[cols[h]] if h in cols else None for k, h in HEADERS.items()})
     df['deadline'] = pd.to_datetime(df.deadline, dayfirst=True, errors='coerce')
     df = df.dropna(subset=['name'])
@@ -208,6 +211,50 @@ def load(path):
     df['direction'] = df.apply(direction_of, axis=1)
     df['customer'] = df.cust.map(customer_of)
     df['law'] = df.apply(law_of, axis=1)
+    df['size'] = pd.cut(df.nmck, [0, 3e6, 15e6, 60e6, 300e6, 1e12],
+                        labels=['до 3 млн', '3–15 млн', '15–60 млн', '60–300 млн', '300 млн+'])
+    return df
+
+
+TEMPLATE_STATUS = {'заключен': 'заключен', 'не состоялась': 'не состоялась', 'отменена': 'отменена',
+                   'неизвестно': 'неизвестно', 'идёт приём': 'не заполнено', 'итог не внесён': 'не заполнено'}
+TEMPLATE_REASON = {'одна заявка': 'одна заявка / один допущенный', 'один допущенный': 'одна заявка / один допущенный',
+                   'никого не допустили': 'нет заявок / никого не допустили',
+                   'нет заявок': 'нет заявок / никого не допустили', 'другое': 'другое'}
+
+
+def _num(v):
+    if isinstance(v, str):
+        v = v.replace('\xa0', '').replace(' ', '').replace('₽', '').replace('%', '').replace(',', '.')
+    return pd.to_numeric(v, errors='coerce')
+
+
+def load_template(raw, cols):
+    """Новый шаблон (лист «Тендеры»): статус, снижение и причина — отдельными колонками."""
+    g = lambda name: raw[cols[name]] if name in cols else pd.Series(None, index=raw.index)  # noqa: E731
+    df = pd.DataFrame({
+        'name': g('наименование'), 'cust': g('заказчик'), 'gov': g('ссылка еис / площадка'),
+        'kontur': g('ссылка контур'), 'ptype': g('закон / способ'), 'addr': g('адрес'),
+        'deadline': pd.to_datetime(g('окончание подачи'), dayfirst=True, errors='coerce'),
+        'tag': g('направление'), 'adv': g('аванс, %'), 'term': g('срок исполнения'),
+        'date': g('дата добавления'), 'K': g('статус'), 'L': g('исходная запись (из старой таблицы)'),
+        'winner': g('победитель / единственный участник'),
+    }).dropna(subset=['name'])
+    df['status'] = df.K.map(lambda s: TEMPLATE_STATUS.get(str(s).strip().lower(), 'не заполнено'))
+    drop = g('снижение, %').loc[df.index].map(_num)
+    # в Excel хранится долей (0.125), в CSV из Google может прийти «12,5%»
+    df['drop_pct'] = drop.where(drop > 1, drop * 100).abs()
+    df['fail_reason'] = g('причина (если не состоялась)').loc[df.index].map(
+        lambda s: TEMPLATE_REASON.get(str(s).strip().lower()))
+    df.loc[(df.status == 'не состоялась') & df.fail_reason.isna(), 'fail_reason'] = 'другое'
+    df['nmck'] = g('нмцк, ₽').loc[df.index].map(_num)
+    region = g('регион').loc[df.index]
+    df['region'] = region.where(region.notna(), df.apply(region_of, axis=1))
+    direction = df.tag
+    df['direction'] = direction.where(direction.notna(), df.apply(direction_of, axis=1))
+    df['customer'] = df.cust.map(customer_of)
+    law = df.ptype.astype(str)
+    df['law'] = law.map(lambda t: '44-ФЗ' if str(t).startswith('44') else '223-ФЗ / коммерческие')
     df['size'] = pd.cut(df.nmck, [0, 3e6, 15e6, 60e6, 300e6, 1e12],
                         labels=['до 3 млн', '3–15 млн', '15–60 млн', '60–300 млн', '300 млн+'])
     return df
