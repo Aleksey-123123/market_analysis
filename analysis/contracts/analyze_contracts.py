@@ -229,6 +229,18 @@ def _num(v):
     return pd.to_numeric(v, errors='coerce')
 
 
+def _pct(v):
+    """«12,5%» из CSV — уже проценты; 0.125 из Excel — доля."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    x = _num(v)
+    if pd.isna(x):
+        return None
+    if isinstance(v, str) and '%' in v:
+        return abs(x)
+    return abs(x * 100 if abs(x) <= 1 else x)
+
+
 def load_template(raw, cols):
     """Новый шаблон (лист «Тендеры»): статус, снижение и причина — отдельными колонками."""
     g = lambda name: raw[cols[name]] if name in cols else pd.Series(None, index=raw.index)  # noqa: E731
@@ -239,11 +251,14 @@ def load_template(raw, cols):
         'tag': g('направление'), 'adv': g('аванс, %'), 'term': g('срок исполнения'),
         'date': g('дата добавления'), 'K': g('статус'), 'L': g('исходная запись (из старой таблицы)'),
         'winner': g('победитель / единственный участник'),
+        'participants': g('число участников').map(_num),
+        'our_result': g('наш результат'),
     }).dropna(subset=['name'])
     df['status'] = df.K.map(lambda s: TEMPLATE_STATUS.get(str(s).strip().lower(), 'не заполнено'))
-    drop = g('снижение, %').loc[df.index].map(_num)
-    # в Excel хранится долей (0.125), в CSV из Google может прийти «12,5%»
-    df['drop_pct'] = drop.where(drop > 1, drop * 100).abs()
+    df['drop_pct'] = g('снижение, %').loc[df.index].map(_pct)
+    # снижение внесено, а статус забыли поменять — считаем контракт заключённым
+    df['status_inferred'] = (df.status == 'не заполнено') & df.drop_pct.notna()
+    df.loc[df.status_inferred, 'status'] = 'заключен'
     df['fail_reason'] = g('причина (если не состоялась)').loc[df.index].map(
         lambda s: TEMPLATE_REASON.get(str(s).strip().lower()))
     df.loc[(df.status == 'не состоялась') & df.fail_reason.isna(), 'fail_reason'] = 'другое'
@@ -272,6 +287,8 @@ def summary(df, by):
         'из них нет допущенных': df[df.fail_reason == 'нет заявок / никого не допустили'].groupby(by, observed=True).size(),
         'медиана снижения, %': df[df.status == 'заключен'].groupby(by, observed=True).drop_pct.median(),
         'среднее снижение, %': df[df.status == 'заключен'].groupby(by, observed=True).drop_pct.mean(),
+        'медиана участников': df.groupby(by, observed=True).participants.median()
+        if 'participants' in df else None,
         'НМЦК всего, млн': g.nmck.sum() / 1e6,
     }).fillna({'итог известен': 0, 'заключено': 0, 'не состоялось': 0,
                'из них одна заявка': 0, 'из них нет допущенных': 0})
@@ -279,28 +296,69 @@ def summary(df, by):
     return out.round(1).sort_values('всего закупок', ascending=False)
 
 
+FLAG_RULES = [
+    ('> 100 млн', lambda r: (r.nmck or 0) > 100e6),
+    ('кап. ремонт', lambda r: bool(re.search(r'капитальн', re.sub(
+        r'не относящ\w* к капитальн\w*', '', str(r['name']), flags=re.I), re.I))),
+    ('реконструкция', lambda r: bool(re.search(r'реконструкц', re.sub(
+        r'после проведения работ по реконструкции', '', str(r['name']), flags=re.I), re.I))),
+    ('проектное СРО', lambda r: bool(re.search(
+        r'проектн|рабоч\w* документац|ПИР\b|изыскан|проектирован|разработк\w* (проектн|рабоч|документ)',
+        str(r['name']), re.I))),
+]
+
+
+def _hist(g):
+    z = g[g.status == 'заключен']
+    return {'n': len(g), 'n_drop': int(z.drop_pct.notna().sum()),
+            'n_part': int(g.participants.notna().sum()) if 'participants' in g else 0,
+            'fail': (g.status == 'не состоялась').mean() if len(g) else None,
+            'drop': z.drop_pct.median() if z.drop_pct.notna().any() else None,
+            'part': g.participants.median() if 'participants' in g and g.participants.notna().any() else None}
+
+
 def open_tenders(df, today):
-    """Открытые тендеры + история по заказчику и по связке направление×регион."""
+    """Открытые тендеры: история заказчика/сегмента, оценка конкуренции, флаги ограничений."""
     hist = df[df.status.isin(['заключен', 'не состоялась'])]
-
-    def stats(g):
-        if g.empty:
-            return pd.Series({'изв': 0, 'не сост., %': None, 'мед. снижение, %': None})
-        z = g[g.status == 'заключен'].drop_pct
-        return pd.Series({'изв': len(g),
-                          'не сост., %': round(100 * (g.status == 'не состоялась').mean()),
-                          'мед. снижение, %': round(z.median(), 1) if z.notna().any() else None})
-
-    o = df[df.deadline >= today].copy()
     rows = []
-    for _, r in o.iterrows():
-        c = stats(hist[hist.customer == r.customer]).add_prefix('заказчик: ')
-        s = stats(hist[(hist.direction == r.direction) & (hist.region == r.region)]).add_prefix('сегмент: ')
-        rows.append(pd.concat([c, s]))
-    o = pd.concat([o.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
-    cols = ['deadline', 'name', 'customer', 'region', 'direction', 'law', 'nmck', 'adv'] + \
-        [c for c in o.columns if c.startswith(('заказчик: ', 'сегмент: '))] + ['gov']
-    return o[cols].sort_values('deadline')
+    for _, r in df[df.deadline >= today].iterrows():
+        hc = _hist(hist[hist.customer == r.customer])
+        hs = _hist(hist[(hist.direction == r.direction) & (hist.region == r.region)])
+        hd = _hist(hist[hist.direction == r.direction])
+        # Сглаживание: заказчик и сегмент весят по числу итогов, направление — как априорное (вес 5),
+        # чтобы 2–3 итога не давали «100% несостоявшихся».
+        def pick(key):
+            num = den = 0.0
+            wkey = {'fail': 'n', 'drop': 'n_drop', 'part': 'n_part'}[key]
+            for h, w in ((hc, hc[wkey]), (hs, hs[wkey]), (hd, 5)):
+                v = h[key]
+                if w and v is not None and not pd.isna(v):
+                    num += w * v
+                    den += w
+            return num / den if den else None
+        fail, drop, part = pick('fail'), pick('drop'), pick('part')
+        score = 0.0
+        score += 40 * (fail if fail is not None else 0.4)
+        score += 40 * (1 - min((drop if drop is not None else 20) / 40, 1))
+        score += 20 * (1 - min(((part if part is not None else 3) - 1) / 6, 1))
+        flags = [name for name, rule in FLAG_RULES if rule(r)]
+        rows.append({
+            'балл': round(score),
+            'достоверность': 'высокая' if hc['n'] >= 3 or hs['n'] >= 8 else ('средняя' if hc['n'] + hs['n'] >= 3 else 'низкая'),
+            'флаги': ', '.join(flags),
+            'окончание подачи': r.deadline, 'наименование': r['name'], 'заказчик': r.customer,
+            'регион': r.region, 'направление': r.direction, 'НМЦК, млн': round((r.nmck or 0) / 1e6, 1) or None,
+            'аванс': r.adv,
+            'ожид. доля несостоявшихся, %': None if fail is None else round(100 * fail),
+            'ожид. снижение, %': None if drop is None else round(drop, 1),
+            'ожид. участников': None if part is None else round(part, 1),
+            'заказчик: итогов': hc['n'],
+            'заказчик: не сост., %': None if hc['fail'] is None else round(100 * hc['fail']),
+            'заказчик: мед. снижение, %': hc['drop'],
+            'сегмент: итогов': hs['n'],
+            'ссылка': r.gov,
+        })
+    return pd.DataFrame(rows).sort_values('балл', ascending=False)
 
 
 def main():
