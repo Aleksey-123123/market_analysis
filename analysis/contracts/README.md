@@ -109,3 +109,8 @@
 Листы: «Инструкция», «Тендеры» (данные + выпадающие списки), «Сводка» (формулы), «Справочники» (значения списков).
 Анализ по новому шаблону: `python analyze_contracts.py tenders.xlsx contracts_analysis.xlsx`
 (понимает и xlsx, и CSV-выгрузку листа «Тендеры» из Google Таблиц).
+
+## Отчёт в Markdown (вместо Excel)
+
+`python analyze_contracts.py source_ДД.ММ.ГГГГ.csv ../../reports/ГГГГ-ММ-ДД.md [выводы.md]` — собирает
+отчёт в папку `reports/` (список отчётов — `reports/README.md`).

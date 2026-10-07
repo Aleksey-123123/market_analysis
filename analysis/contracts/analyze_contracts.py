@@ -1,6 +1,6 @@
 """Анализ итогов закупок из рабочей таблицы (колонки K — контракт, L — итог).
 
-Запуск: python analyze_contracts.py путь/к/таблице.(xlsx|csv) [out.xlsx]
+Запуск: python analyze_contracts.py таблица.(csv|xlsx) отчёт.md [выводы.md] [ДД.ММ.ГГГГ ЧЧ:ММ]
 """
 import re
 import sys
@@ -139,6 +139,7 @@ CUSTOMER_ALIASES = [
     (r'управление автомобильных дорог алтайского края', 'КГКУ Упрдор Алтайского края'),
     (r'горно-алтайавтодор', 'КУ РА Горно-Алтайавтодор'),
     (r'управление автомобильных дорог томской', 'ОГКУ Упрдор Томской обл.'),
+    (r'москв\w*.*гормост', 'ГБУ «Гормост» (Москва)'),
     (r'гормост', 'МКУ «Гормост» (Новосибирск)'),
     (r'региональные электрические сети', 'АО «РЭС» (Новосибирск)'),
     (r'россети', 'Россети (разные филиалы)'),
@@ -264,7 +265,10 @@ def load_template(raw, cols):
     df.loc[(df.status == 'не состоялась') & df.fail_reason.isna(), 'fail_reason'] = 'другое'
     df['nmck'] = g('нмцк, ₽').loc[df.index].map(_num)
     region = g('регион').loc[df.index]
-    df['region'] = region.where(region.notna(), df.apply(region_of, axis=1))
+    auto = df.apply(region_of, axis=1)
+    # пусто или «Прочие регионы», а по тексту регион определяется точно — берём определённый
+    use_auto = region.isna() | ((region == 'Прочие регионы') & ~auto.isin(['не определен', 'Прочие регионы']))
+    df['region'] = region.where(~use_auto, auto)
     direction = df.tag
     df['direction'] = direction.where(direction.notna(), df.apply(direction_of, axis=1))
     df['customer'] = df.cust.map(customer_of)
@@ -361,33 +365,125 @@ def open_tenders(df, today):
     return pd.DataFrame(rows).sort_values('балл', ascending=False)
 
 
+def _fmt(v, nd=0, suf=''):
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return '—'
+    return f"{v:.{nd}f}{suf}".replace('.', ',') if isinstance(v, (int, float)) else str(v)
+
+
+def _short(text, n=95):
+    t = re.sub(r'\s+', ' ', str(text)).strip().replace('|', '/')
+    return t if len(t) <= n else t[:n - 1].rstrip() + '…'
+
+
+def _tender_table(o):
+    lines = ['| Балл | Подача до | Тендер | Заказчик | Регион | НМЦК, млн | Ожид. участников / снижение | Ограничения |',
+             '|---|---|---|---|---|---|---|---|']
+    for _, r in o.iterrows():
+        name = _short(r['наименование'])
+        link = r['ссылка'] if isinstance(r['ссылка'], str) and r['ссылка'].startswith('http') else None
+        name = f"[{name}]({link})" if link else name
+        flags = ('⚠ ' + r['флаги']) if r['флаги'] else ''
+        rel = '' if r['достоверность'] == 'высокая' else f" ({r['достоверность']} достов.)"
+        lines.append(
+            f"| {r['балл']}{rel} | {r['окончание подачи']:%d.%m %H:%M} | {name} | {_short(r['заказчик'], 45)} | "
+            f"{r['регион']} | {_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} / {_fmt(r['ожид. снижение, %'], 0, '%')} | {flags} |")
+    return '\n'.join(lines)
+
+
+def _summary_table(df, by, title, min_known=1):
+    sm = summary(df, by)
+    sm = sm[sm['итог известен'] >= min_known].sort_values('итог известен', ascending=False)
+    lines = [f'| {title} | Итог известен | Не состоялось | Медиана снижения | Медиана участников |',
+             '|---|---|---|---|---|']
+    for k, r in sm.iterrows():
+        lines.append(f"| {_short(k, 60)} | {int(r['итог известен'])} | {_fmt(r['доля несостоявшихся, %'], 0, '%')} | "
+                     f"{_fmt(r['медиана снижения, %'], 1, '%')} | {_fmt(r['медиана участников'], 1)} |")
+    return '\n'.join(lines)
+
+
+def report_md(df, now, conclusions=''):
+    """Простой Markdown-отчёт: выводы, открытые тендеры по группам, статистика."""
+    o = open_tenders(df, now)
+    known = df[df.status.isin(['заключен', 'не состоялась'])]
+    z = known[known.status == 'заключен']
+    top = o[(o['балл'] >= 65) & (o['достоверность'] != 'низкая')]
+    mid = o[~o.index.isin(top.index) & (o['балл'] >= 50)]
+    low = o[o['балл'] < 50]
+    part = z.groupby(z.participants.clip(upper=6)).drop_pct.agg(['count', 'median'])
+    part_rows = '\n'.join(
+        f"| {'6 и больше' if k >= 6 else int(k)} | {int(r['count'])} | {_fmt(r['median'], 1, '%')} |"
+        for k, r in part.iterrows())
+    single = int(((known.participants == 1) & (known.status == 'не состоялась')).sum())
+    out = [
+        f"# Тендеры: где подаваться — {now:%d.%m.%Y}",
+        '',
+        f"Данные: {len(df)} закупок, итог известен по {len(known)} "
+        f"(заключено {len(z)}, не состоялось {len(known) - len(z)}). "
+        f"Открытых тендеров (приём заявок не закончился): **{len(o)}**.",
+        '',
+        '⚠ — ограничения: больше 100 млн, капитальный ремонт, реконструкция или нужна проектная СРО '
+        '(определено по названию закупки — проверить по документации). Такие тендеры оставлены в выборке.',
+        '',
+    ]
+    if conclusions:
+        out += [conclusions.strip(), '']
+    out += [
+        f"## 1. Подавать в первую очередь ({len(top)})",
+        '',
+        'Высокий балл: заказчик/сегмент часто без конкуренции, снижение небольшое.',
+        '',
+        _tender_table(top) if len(top) else '_нет_',
+        '',
+        f"## 2. Можно рассмотреть ({len(mid)})",
+        '',
+        _tender_table(mid) if len(mid) else '_нет_',
+        '',
+        f"## 3. Скорее не стоит ({len(low)})",
+        '',
+        'Много участников и сильный демпинг по истории.',
+        '',
+        _tender_table(low) if len(low) else '_нет_',
+        '',
+        '## 4. На чём основан балл',
+        '',
+        'Балл 0–100 = ожидаемая доля несостоявшихся (40) + малое снижение (40) + мало участников (20). '
+        'Ожидания берутся из истории заказчика и связки «направление × регион», при малой истории — '
+        'подтягиваются к среднему по направлению. «Достоверность» показывает, сколько истории за баллом.',
+        '',
+        '### Снижение в зависимости от числа участников',
+        '',
+        '| Участников | Контрактов | Медиана снижения |',
+        '|---|---|---|',
+        f"| 1 | {single} | закупка «не состоялась», контракт с единственным участником ≈ по НМЦК |",
+        part_rows,
+        '',
+        '### По направлениям',
+        '',
+        _summary_table(df, 'direction', 'Направление'),
+        '',
+        '### По регионам',
+        '',
+        _summary_table(df, 'region', 'Регион'),
+        '',
+        '### Заказчики (от 4 известных итогов)',
+        '',
+        _summary_table(df, 'customer', 'Заказчик', min_known=4),
+        '',
+        '---',
+        '_Отчёт собран скриптом `analyze_contracts.py`. Колонки: «Ожид. участников / снижение» — прогноз по истории._',
+    ]
+    return '\n'.join(out) + '\n'
+
+
 def main():
-    src = sys.argv[1]
-    dst = sys.argv[2] if len(sys.argv) > 2 else 'contracts_analysis.xlsx'
+    """python analyze_contracts.py таблица.(csv|xlsx) отчёт.md [выводы.md] [ДД.ММ.ГГГГ ЧЧ:ММ]"""
+    src, dst = sys.argv[1], sys.argv[2]
+    conclusions = open(sys.argv[3], encoding='utf-8').read() if len(sys.argv) > 3 and sys.argv[3] != '-' else ''
+    now = pd.to_datetime(sys.argv[4], dayfirst=True) if len(sys.argv) > 4 else pd.Timestamp.now()
     df = load(src)
-    with pd.ExcelWriter(dst) as xw:
-        cols = ['date', 'deadline', 'name', 'customer', 'region', 'direction', 'law', 'nmck', 'size',
-                'status', 'drop_pct', 'winner', 'fail_reason', 'K', 'L', 'gov']
-        df[cols].to_excel(xw, sheet_name='данные', index=False)
-        summary(df, 'status').to_excel(xw, sheet_name='итоги')
-        summary(df, 'direction').to_excel(xw, sheet_name='по направлениям')
-        summary(df, 'region').to_excel(xw, sheet_name='по регионам')
-        summary(df, 'customer').to_excel(xw, sheet_name='по заказчикам')
-        summary(df, 'law').to_excel(xw, sheet_name='по закону')
-        summary(df, 'size').to_excel(xw, sheet_name='по размеру НМЦК')
-        w = df[df.winner.notna()]
-        w.groupby('winner').agg(
-            побед=('status', lambda s: (s == 'заключен').sum()),
-            единственный_участник=('status', lambda s: (s == 'не состоялась').sum()),
-            снижение_медиана=('drop_pct', 'median'),
-            регионы=('region', lambda s: ', '.join(sorted(set(s)))),
-            направления=('direction', lambda s: ', '.join(sorted(set(s)))),
-            НМЦК_млн=('nmck', lambda s: round(s.sum() / 1e6, 1)),
-        ).sort_values(['побед', 'единственный_участник'], ascending=False).to_excel(xw, sheet_name='победители')
-        open_tenders(df, pd.Timestamp.today().normalize()).to_excel(
-            xw, sheet_name='открытые тендеры', index=False)
-        df[df.status == 'не состоялась'][['name', 'customer', 'region', 'direction', 'nmck', 'fail_reason', 'L', 'gov']] \
-            .sort_values('nmck', ascending=False).to_excel(xw, sheet_name='несостоявшиеся', index=False)
+    with open(dst, 'w', encoding='utf-8') as f:
+        f.write(report_md(df, now, conclusions))
     return df
 
 
