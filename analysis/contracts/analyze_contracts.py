@@ -312,6 +312,33 @@ FLAG_RULES = [
 ]
 
 
+# Не наш профиль: тендер остаётся в списке, но балл снижается.
+# (название правила, штраф, регулярное выражение по названию закупки)
+OFF_PROFILE = [
+    ('дорожное покрытие / земполотно', 25,
+     r'восстановлени\w* (дорожного |асфальтобетонного )?покрыти|земляного полотна|деформаций и повреждений дорожного покрытия|'
+     r'ямочн|слоев износа|асфальтировани|асфальтобетонного покрытия'),
+    ('общестрой', 25, r'производственной базы|окон|двер|отделочн|кровл|фасад|текущ\w* ремонт\w* (помещени|здани)'),
+    ('зимнее содержание / снег', 25, r'зимн|снег|очистк\w* (автодорог|дорог)'),
+    ('видеонаблюдение / сигнализация / светофоры', 25, r'видеонаблюд|сигнализац|светофор'),
+    ('детские площадки / МАФ', 25, r'детск\w* (игров\w* )?площадк|игров\w* (элемент|оборудован|комплекс)|малых архитектурных форм|\bМАФ'),
+]
+# «Свои» регионы — без штрафа; остальные (Омск, Иркутск, Бурятия, Красноярск, Хакасия, Тюмень, Сургут…) — минус.
+CORE_REGIONS = {'Новосибирская обл.', 'Алтайский край', 'Республика Алтай', 'Кемеровская обл. (Кузбасс)',
+                'Москва и МО', 'Томская обл.', 'не определен'}
+REGION_PENALTY = 8
+
+
+def profile_penalty(r):
+    hits = [(name, pen) for name, pen, pat in OFF_PROFILE if re.search(pat, str(r['name']), re.I)]
+    pen = max((p for _, p in hits), default=0)
+    notes = [name for name, _ in hits]
+    if r.region not in CORE_REGIONS:
+        pen += REGION_PENALTY
+        notes.append('дальний регион')
+    return pen, notes
+
+
 def _hist(g):
     z = g[g.status == 'заключен']
     return {'n': len(g), 'n_drop': int(z.drop_pct.notna().sum()),
@@ -346,8 +373,10 @@ def open_tenders(df, today):
         score += 40 * (1 - min((drop if drop is not None else 20) / 40, 1))
         score += 20 * (1 - min(((part if part is not None else 3) - 1) / 6, 1))
         flags = [name for name, rule in FLAG_RULES if rule(r)]
+        pen, notes = profile_penalty(r)
         rows.append({
-            'балл': round(score),
+            'балл': max(round(score - pen), 0), 'балл по истории': round(score),
+            'не профиль': ', '.join(notes),
             'достоверность': 'высокая' if hc['n'] >= 3 or hs['n'] >= 8 else ('средняя' if hc['n'] + hs['n'] >= 3 else 'низкая'),
             'флаги': ', '.join(flags),
             'окончание подачи': r.deadline, 'наименование': r['name'], 'заказчик': r.customer,
@@ -360,7 +389,7 @@ def open_tenders(df, today):
             'заказчик: не сост., %': None if hc['fail'] is None else round(100 * hc['fail']),
             'заказчик: мед. снижение, %': hc['drop'],
             'сегмент: итогов': hs['n'],
-            'ссылка': r.gov,
+            'ссылка': r.gov, 'контур': r.kontur,
         })
     return pd.DataFrame(rows).sort_values('балл', ascending=False)
 
@@ -376,18 +405,42 @@ def _short(text, n=95):
     return t if len(t) <= n else t[:n - 1].rstrip() + '…'
 
 
+REGION_SHORT = {
+    'Новосибирская обл.': 'НСО', 'Москва и МО': 'Москва/МО', 'Кемеровская обл. (Кузбасс)': 'Кузбасс',
+    'Алтайский край': 'Алт. край', 'Республика Алтай': 'Респ. Алтай', 'Томская обл.': 'Томск',
+    'Омская обл.': 'Омск', 'Иркутская обл. / Бурятия / Забайкалье': 'Иркутск/Бурятия',
+    'Красноярский край / Хакасия / Тыва': 'Красноярск/Хакасия', 'Прочие регионы': 'прочие',
+    'не определен': '?',
+}
+
+
+def _link(url, label):
+    return f"[{label}]({url})" if isinstance(url, str) and url.startswith('http') else ''
+
+
 def _tender_table(o):
-    lines = ['| Балл | Подача до | Тендер | Заказчик | Регион | НМЦК, млн | Ожид. участников / снижение | Ограничения |',
+    """Полное название мелким шрифтом, ссылки на ЕИС и Контур отдельной колонкой."""
+    lines = ['| Балл | До | Тендер / заказчик | Регион | НМЦК, млн | Ожид. уч. / сниж. | Ссылки | Пометки |',
              '|---|---|---|---|---|---|---|---|']
     for _, r in o.iterrows():
-        name = _short(r['наименование'])
-        link = r['ссылка'] if isinstance(r['ссылка'], str) and r['ссылка'].startswith('http') else None
-        name = f"[{name}]({link})" if link else name
-        flags = ('⚠ ' + r['флаги']) if r['флаги'] else ''
-        rel = '' if r['достоверность'] == 'высокая' else f" ({r['достоверность']} достов.)"
+        name = re.sub(r'\s+', ' ', str(r['наименование'])).strip().replace('|', '/')
+        cust = _short(r['заказчик'], 70)
+        tender = f"<small>{name}</small><br><small><i>{cust}</i></small>"
+        score = f"**{r['балл']}**"
+        if r['достоверность'] != 'высокая':
+            score += f"<br><small>{r['достоверность']} достов.</small>"
+        if r['балл'] != r['балл по истории']:
+            score += f"<br><small>по истории {r['балл по истории']}</small>"
+        links = ' · '.join(x for x in (_link(r['ссылка'], 'ЕИС'), _link(r['контур'], 'Контур')) if x)
+        marks = []
+        if r['флаги']:
+            marks.append('⚠ ' + r['флаги'])
+        if r['не профиль']:
+            marks.append('↓ ' + r['не профиль'])
         lines.append(
-            f"| {r['балл']}{rel} | {r['окончание подачи']:%d.%m %H:%M} | {name} | {_short(r['заказчик'], 45)} | "
-            f"{r['регион']} | {_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} / {_fmt(r['ожид. снижение, %'], 0, '%')} | {flags} |")
+            f"| {score} | {r['окончание подачи']:%d.%m %H:%M} | {tender} | {REGION_SHORT.get(r['регион'], r['регион'])} | "
+            f"{_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} / {_fmt(r['ожид. снижение, %'], 0, '%')} | "
+            f"{links} | <small>{'<br>'.join(marks)}</small> |")
     return '\n'.join(lines)
 
 
@@ -402,7 +455,7 @@ def _summary_table(df, by, title, min_known=1):
     return '\n'.join(lines)
 
 
-def report_md(df, now, conclusions=''):
+def report_md(df, now, conclusions='', data_date=None):
     """Простой Markdown-отчёт: выводы, открытые тендеры по группам, статистика."""
     o = open_tenders(df, now)
     known = df[df.status.isin(['заключен', 'не состоялась'])]
@@ -416,7 +469,7 @@ def report_md(df, now, conclusions=''):
         for k, r in part.iterrows())
     single = int(((known.participants == 1) & (known.status == 'не состоялась')).sum())
     out = [
-        f"# Тендеры: где подаваться — {now:%d.%m.%Y}",
+        f"# Тендеры: где подаваться — {now:%d.%m.%Y}" + (f" (таблица от {data_date})" if data_date else ''),
         '',
         f"Данные: {len(df)} закупок, итог известен по {len(known)} "
         f"(заключено {len(z)}, не состоялось {len(known) - len(z)}). "
@@ -424,6 +477,9 @@ def report_md(df, now, conclusions=''):
         '',
         '⚠ — ограничения: больше 100 млн, капитальный ремонт, реконструкция или нужна проектная СРО '
         '(определено по названию закупки — проверить по документации). Такие тендеры оставлены в выборке.',
+        '',
+        '↓ — балл снижен: не наш профиль (дорожное покрытие, общестрой, зимнее содержание, видеонаблюдение / '
+        'сигнализация / светофоры, детские площадки / МАФ) или дальний регион. «По истории» — балл до снижения.',
         '',
     ]
     if conclusions:
@@ -447,7 +503,8 @@ def report_md(df, now, conclusions=''):
         '',
         '## 4. На чём основан балл',
         '',
-        'Балл 0–100 = ожидаемая доля несостоявшихся (40) + малое снижение (40) + мало участников (20). '
+        'Балл 0–100 = ожидаемая доля несостоявшихся (40) + малое снижение (40) + мало участников (20), '
+        'минус 25 за не наш профиль и минус 8 за регион вне НСО, Алтая, Кузбасса, Москвы/МО, Томска. '
         'Ожидания берутся из истории заказчика и связки «направление × регион», при малой истории — '
         'подтягиваются к среднему по направлению. «Достоверность» показывает, сколько истории за баллом.',
         '',
@@ -481,9 +538,11 @@ def main():
     src, dst = sys.argv[1], sys.argv[2]
     conclusions = open(sys.argv[3], encoding='utf-8').read() if len(sys.argv) > 3 and sys.argv[3] != '-' else ''
     now = pd.to_datetime(sys.argv[4], dayfirst=True) if len(sys.argv) > 4 else pd.Timestamp.now()
+    m = re.search(r'(\d{2}\.\d{2}\.\d{4})', src)
+    data_date = m.group(1) if m and m.group(1) != f"{now:%d.%m.%Y}" else None
     df = load(src)
     with open(dst, 'w', encoding='utf-8') as f:
-        f.write(report_md(df, now, conclusions))
+        f.write(report_md(df, now, conclusions, data_date))
     return df
 
 
