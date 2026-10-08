@@ -379,6 +379,8 @@ OFF_PROFILE = [
 CORE_REGIONS = {'Новосибирская обл.', 'Алтайский край', 'Республика Алтай', 'Кемеровская обл. (Кузбасс)',
                 'Москва и МО', 'Томская обл.', 'не определен'}
 REGION_PENALTY = 8
+# Аванс — плюс к баллу: до 30% → +5, от 30% → +10.
+ADVANCE_BONUS, ADVANCE_BONUS_HIGH = 5, 10
 
 
 ROAD = r'автомобильн\w* дорог|автодорог|\bа/д\b|тротуар|дорожн\w* покрыти|проезд|улично-дорожн'
@@ -436,8 +438,11 @@ def open_tenders(df, today):
         score += 20 * (1 - min(((part if part is not None else 3) - 1) / 6, 1))
         flags = [name for name, rule in FLAG_RULES if rule(r)]
         pen, notes = profile_penalty(r)
+        adv = _pct(r.adv) or 0
+        bonus = ADVANCE_BONUS_HIGH if adv >= 30 else (ADVANCE_BONUS if adv > 0 else 0)
         rows.append({
-            'балл': max(round(score - pen), 0), 'балл по истории': round(score),
+            'балл': max(round(score - pen + bonus), 0), 'балл по истории': round(score),
+            'аванс, %': adv or None,
             'не профиль': ', '.join(notes),
             'достоверность': 'высокая' if hc['n'] >= 3 or hs['n'] >= 8 else ('средняя' if hc['n'] + hs['n'] >= 3 else 'низкая'),
             'флаги': ', '.join(flags),
@@ -491,9 +496,12 @@ def _tender_table(o):
         cust = _short(r['заказчик'], 70)
         tender = f"<small>{name}</small><br><small><i>{cust}</i></small>"
         score = f"**{r['балл']}**"
+        has_adv = pd.notna(r['аванс, %']) and r['аванс, %'] > 0
+        if has_adv:
+            score += f"<br>💰 аванс {_fmt(r['аванс, %'], 0, '%')}"
         if r['достоверность'] != 'высокая':
             score += f"<br><small>{r['достоверность']} достов.</small>"
-        if r['балл'] != r['балл по истории']:
+        if r['балл'] != r['балл по истории'] and not (has_adv and not r['не профиль']):
             score += f"<br><small>по истории {r['балл по истории']}</small>"
         links = ' · '.join(x for x in (_link(r['ссылка'], 'ЕИС'), _link(r['контур'], 'Контур')) if x)
         marks = []
@@ -551,6 +559,8 @@ def report_md(df, now, conclusions='', data_date=None):
         'общестрой, зимнее содержание, видеонаблюдение / сигнализация / светофоры, детские площадки / МАФ) '
         'или дальний регион. «По истории» — балл до снижения. ✎ — ручная поправка.',
         '',
+        '💰 — есть аванс: балл поднят (+5, при авансе от 30% — +10).',
+        '',
     ]
     if conclusions:
         out += [conclusions.strip(), '']
@@ -583,6 +593,7 @@ def report_md(df, now, conclusions='', data_date=None):
         '## 4. На чём основан балл',
         '',
         'Балл 0–100 = ожидаемая доля несостоявшихся (40) + малое снижение (40) + мало участников (20), '
+        'плюс 5 за аванс (плюс 10 при авансе от 30%), '
         'минус 25 за не наш профиль (в т.ч. просто ремонт дорог без моста/съезда/трубы/подпорной стены и работы '
         '«по заявкам» без гарантированного объёма) и минус 8 за регион вне НСО, Алтая, Кузбасса, Москвы/МО, Томска. '
         'Ручные поправки (✎) — в файле `analysis/contracts/corrections.csv`, пока их не внесли в таблицу. '
