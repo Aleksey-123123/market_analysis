@@ -3,6 +3,7 @@
 Запуск: python analyze_contracts.py таблица.(csv|xlsx) отчёт.md [выводы.md] [ДД.ММ.ГГГГ ЧЧ:ММ]
 """
 import re
+from pathlib import Path
 import sys
 
 import pandas as pd
@@ -117,7 +118,7 @@ DIRECTIONS = [
     ('Барьеры / БДД / ограждения', r'барьерн|ограждени|указател|дорожных знак|светофор|безопасности дорожного'),
     ('Электросети и освещение', r'ЛЭП|освещ|КЛ-|ВЛ |ТП-|ПС |подстанц|электр|КРУН|РП-|кабельн|трасс\w* ВЛ'),
     ('Вода, тепло, газ, канализация', r'водо|канализ|тепло|теплотрасс|газ|КНС|ГВС|очистк\w* подземных'),
-    ('Благоустройство и озеленение', r'благоустр|озелен|газон|деревьев|насажден|растени|лесовосст|каток|катка|ледов|фонтан|рубк|сквер|парк'),
+    ('Благоустройство и озеленение', r'благоустр|контейнерн|озелен|газон|деревьев|насажден|растени|лесовосст|каток|катка|ледов|фонтан|рубк|сквер|парк'),
     ('Здания, монолит, фундаменты', r'здани|монолит|фундамент|кровл|фасад|капитальн\w* ремонт общежит|корпус|строительств\w* объекта|свайн|шпунт|резервуар|укрыти|блок-контейнер|модульн'),
     ('Поставка товаров / IT', r'поставк|ноутбук|компьютер|сервер|панел|приобретение'),
 ]
@@ -230,6 +231,45 @@ def _num(v):
     return pd.to_numeric(v, errors='coerce')
 
 
+EXPLICIT_REGIONS = [
+    ('Красноярский край / Хакасия / Тыва', r'красноярск\w* кра|хакаси|тыва'),
+    ('Иркутская обл. / Бурятия / Забайкалье', r'иркутск\w* област|бурят|забайкальск'),
+    ('Новосибирская обл.', r'новосибирск\w* област'),
+    ('Алтайский край', r'алтайск\w* кра'),
+    ('Республика Алтай', r'республик\w* алтай'),
+    ('Кемеровская обл. (Кузбасс)', r'кемеровск\w* област|кузбасс'),
+    ('Томская обл.', r'томск\w* област'),
+    ('Омская обл.', r'омск\w* област'),
+    ('Москва и МО', r'московск\w* област|г\. ?москв|город\w* москв'),
+]
+
+
+def explicit_region(name):
+    """Регион, прямо названный в тексте закупки (если ровно один)."""
+    text = re.sub(r'границ\w*[^,»"]*', '', str(name), flags=re.I)  # «граница Республики Алтай» — не место работ
+    found = {reg for reg, pat in EXPLICIT_REGIONS if re.search(pat, text, re.I)}
+    return found.pop() if len(found) == 1 else None
+
+
+CORRECTIONS = Path(__file__).with_name('corrections.csv')
+FIELD_MAP = {'статус': 'K', 'регион': 'region', 'подаёмся?': 'decision'}
+
+
+def apply_corrections(df):
+    """Ручные поправки из corrections.csv (пока их не внесли в саму таблицу)."""
+    df['correction'] = None
+    if not CORRECTIONS.exists():
+        return df
+    corr = pd.read_csv(CORRECTIONS, dtype=str)
+    for _, c in corr.iterrows():
+        col = FIELD_MAP.get(str(c['Поле']).strip().lower())
+        mask = df.regnum == str(c['Реестровый номер']).strip()
+        if col and mask.any():
+            df.loc[mask, col] = c['Значение']
+            df.loc[mask, 'correction'] = c['Комментарий']
+    return df
+
+
 def _pct(v):
     """«12,5%» из CSV — уже проценты; 0.125 из Excel — доля."""
     if v is None or (not isinstance(v, str) and pd.isna(v)):
@@ -254,7 +294,11 @@ def load_template(raw, cols):
         'winner': g('победитель / единственный участник'),
         'participants': g('число участников').map(_num),
         'our_result': g('наш результат'),
+        'decision': g('подаёмся?'),
+        'regnum': g('реестровый номер').astype(str).str.strip(),
+        'region': g('регион'),
     }).dropna(subset=['name'])
+    df = apply_corrections(df)
     df['status'] = df.K.map(lambda s: TEMPLATE_STATUS.get(str(s).strip().lower(), 'не заполнено'))
     df['drop_pct'] = g('снижение, %').loc[df.index].map(_pct)
     # снижение внесено, а статус забыли поменять — считаем контракт заключённым
@@ -264,11 +308,17 @@ def load_template(raw, cols):
         lambda s: TEMPLATE_REASON.get(str(s).strip().lower()))
     df.loc[(df.status == 'не состоялась') & df.fail_reason.isna(), 'fail_reason'] = 'другое'
     df['nmck'] = g('нмцк, ₽').loc[df.index].map(_num)
-    region = g('регион').loc[df.index]
+    region = df.region.copy()
     auto = df.apply(region_of, axis=1)
     # пусто или «Прочие регионы», а по тексту регион определяется точно — берём определённый
     use_auto = region.isna() | ((region == 'Прочие регионы') & ~auto.isin(['не определен', 'Прочие регионы']))
     df['region'] = region.where(~use_auto, auto)
+    # регион прямо назван в названии закупки и не совпадает с таблицей — верим названию
+    named = df['name'].map(explicit_region)
+    wrong = named.notna() & (named != df.region) & df.correction.isna()
+    df['region_fixed_from'] = None
+    df.loc[wrong, 'region_fixed_from'] = df.loc[wrong, 'region']
+    df.loc[wrong, 'region'] = named[wrong]
     direction = df.tag
     df['direction'] = direction.where(direction.notna(), df.apply(direction_of, axis=1))
     df['customer'] = df.cust.map(customer_of)
@@ -302,7 +352,7 @@ def summary(df, by):
 
 FLAG_RULES = [
     ('> 100 млн', lambda r: (r.nmck or 0) > 100e6),
-    ('кап. ремонт', lambda r: bool(re.search(r'капитальн', re.sub(
+    ('кап. ремонт', lambda r: bool(re.search(r'капитальн\w* ремонт', re.sub(
         r'не относящ\w* к капитальн\w*', '', str(r['name']), flags=re.I), re.I))),
     ('реконструкция', lambda r: bool(re.search(r'реконструкц', re.sub(
         r'после проведения работ по реконструкции', '', str(r['name']), flags=re.I), re.I))),
@@ -317,10 +367,12 @@ FLAG_RULES = [
 OFF_PROFILE = [
     ('дорожное покрытие / земполотно', 25,
      r'восстановлени\w* (дорожного |асфальтобетонного )?покрыти|земляного полотна|деформаций и повреждений дорожного покрытия|'
-     r'ямочн|слоев износа|асфальтировани|асфальтобетонного покрытия'),
+     r'ямочн|слоев износа|асфальтиров|асфальт\w* покрыти'),
+    ('работы по заявкам, объём не гарантирован', 25,
+     r'дорожно-мостового хозяйства|текущ\w* ремонт\w* и содержани|неопредел\w* объ[её]м|по заявкам'),
     ('общестрой', 25, r'производственной базы|окон|двер|отделочн|кровл|фасад|текущ\w* ремонт\w* (помещени|здани)'),
     ('зимнее содержание / снег', 25, r'зимн|снег|очистк\w* (автодорог|дорог)'),
-    ('видеонаблюдение / сигнализация / светофоры', 25, r'видеонаблюд|сигнализац|светофор'),
+    ('видеонаблюдение / сигнализация / светофоры', 25, r'видеонаблюд|сигнализац|светофор|подсистем\w* безопасности|инженерно-технических средств|ИТСО'),
     ('детские площадки / МАФ', 25, r'детск\w* (игров\w* )?площадк|игров\w* (элемент|оборудован|комплекс)|малых архитектурных форм|\bМАФ'),
 ]
 # «Свои» регионы — без штрафа; остальные (Омск, Иркутск, Бурятия, Красноярск, Хакасия, Тюмень, Сургут…) — минус.
@@ -329,8 +381,17 @@ CORE_REGIONS = {'Новосибирская обл.', 'Алтайский кра
 REGION_PENALTY = 8
 
 
+ROAD = r'автомобильн\w* дорог|автодорог|\bа/д\b|тротуар|дорожн\w* покрыти|проезд|улично-дорожн'
+COMPLEX = (r'мост|путепровод|съезд|развязк|эстакад|тоннел|труб|подпорн|искусственн\w* сооружен|ИССО|откос|'
+           r'берегоукреп|габион|оползн|склон')
+
+
 def profile_penalty(r):
-    hits = [(name, pen) for name, pen, pat in OFF_PROFILE if re.search(pat, str(r['name']), re.I)]
+    name = str(r['name'])
+    hits = [(n, pen) for n, pen, pat in OFF_PROFILE if re.search(pat, name, re.I)]
+    # просто ремонт/содержание дорог неинтересен; с мостом, съездом, трубой и т.п. — рассматриваем
+    if re.search(ROAD, name, re.I) and not re.search(COMPLEX, name, re.I):
+        hits.append(('ремонт дорог без сложных объектов', 25))
     pen = max((p for _, p in hits), default=0)
     notes = [name for name, _ in hits]
     if r.region not in CORE_REGIONS:
@@ -352,7 +413,8 @@ def open_tenders(df, today):
     """Открытые тендеры: история заказчика/сегмента, оценка конкуренции, флаги ограничений."""
     hist = df[df.status.isin(['заключен', 'не состоялась'])]
     rows = []
-    for _, r in df[df.deadline >= today].iterrows():
+    is_open = (df.deadline >= today) & ~df.status.isin(['отменена', 'заключен', 'не состоялась'])
+    for _, r in df[is_open].iterrows():
         hc = _hist(hist[hist.customer == r.customer])
         hs = _hist(hist[(hist.direction == r.direction) & (hist.region == r.region)])
         hd = _hist(hist[hist.direction == r.direction])
@@ -390,6 +452,8 @@ def open_tenders(df, today):
             'заказчик: мед. снижение, %': hc['drop'],
             'сегмент: итогов': hs['n'],
             'ссылка': r.gov, 'контур': r.kontur,
+            'решение': str(r.get('decision') or '').strip().lower() if pd.notna(r.get('decision')) else '',
+            'поправка': r.get('correction') if pd.notna(r.get('correction')) else '',
         })
     return pd.DataFrame(rows).sort_values('балл', ascending=False)
 
@@ -437,6 +501,8 @@ def _tender_table(o):
             marks.append('⚠ ' + r['флаги'])
         if r['не профиль']:
             marks.append('↓ ' + r['не профиль'])
+        if r.get('поправка'):
+            marks.append('✎ ' + r['поправка'])
         lines.append(
             f"| {score} | {r['окончание подачи']:%d.%m %H:%M} | {tender} | {REGION_SHORT.get(r['регион'], r['регион'])} | "
             f"{_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} / {_fmt(r['ожид. снижение, %'], 0, '%')} | "
@@ -460,9 +526,12 @@ def report_md(df, now, conclusions='', data_date=None):
     o = open_tenders(df, now)
     known = df[df.status.isin(['заключен', 'не состоялась'])]
     z = known[known.status == 'заключен']
+    refused = o[o['решение'] == 'нет']
+    o = o[o['решение'] != 'нет']
     top = o[(o['балл'] >= 65) & (o['достоверность'] != 'низкая')]
     mid = o[~o.index.isin(top.index) & (o['балл'] >= 50)]
     low = o[o['балл'] < 50]
+    fixed = df[df.get('region_fixed_from', pd.Series(index=df.index, dtype=object)).notna()]
     part = z.groupby(z.participants.clip(upper=6)).drop_pct.agg(['count', 'median'])
     part_rows = '\n'.join(
         f"| {'6 и больше' if k >= 6 else int(k)} | {int(r['count'])} | {_fmt(r['median'], 1, '%')} |"
@@ -478,8 +547,9 @@ def report_md(df, now, conclusions='', data_date=None):
         '⚠ — ограничения: больше 100 млн, капитальный ремонт, реконструкция или нужна проектная СРО '
         '(определено по названию закупки — проверить по документации). Такие тендеры оставлены в выборке.',
         '',
-        '↓ — балл снижен: не наш профиль (дорожное покрытие, общестрой, зимнее содержание, видеонаблюдение / '
-        'сигнализация / светофоры, детские площадки / МАФ) или дальний регион. «По истории» — балл до снижения.',
+        '↓ — балл снижен: не наш профиль (ремонт дорог без сложных объектов, дорожное покрытие, работы по заявкам, '
+        'общестрой, зимнее содержание, видеонаблюдение / сигнализация / светофоры, детские площадки / МАФ) '
+        'или дальний регион. «По истории» — балл до снижения. ✎ — ручная поправка.',
         '',
     ]
     if conclusions:
@@ -491,6 +561,8 @@ def report_md(df, now, conclusions='', data_date=None):
         '',
         _tender_table(top) if len(top) else '_нет_',
         '',
+        *( [f"### Вы отметили «не подаёмся» ({len(refused)})", '', _tender_table(refused), '']
+           if len(refused) else []),
         f"## 2. Можно рассмотреть ({len(mid)})",
         '',
         _tender_table(mid) if len(mid) else '_нет_',
@@ -501,10 +573,19 @@ def report_md(df, now, conclusions='', data_date=None):
         '',
         _tender_table(low) if len(low) else '_нет_',
         '',
+        *( ['## Регион исправлен по названию закупки', '',
+            'В таблице стоит другой регион, а в названии прямо указан этот. В анализе взят регион из названия — '
+            'стоит поправить в таблице.', '',
+            '| Реестровый номер | В таблице | По названию | Закупка |', '|---|---|---|---|',
+            *[f"| {r.regnum} | {r.region_fixed_from} | {r.region} | <small>{_short(r['name'], 120)}</small> |"
+              for _, r in fixed.iterrows()], '']
+           if len(fixed) else []),
         '## 4. На чём основан балл',
         '',
         'Балл 0–100 = ожидаемая доля несостоявшихся (40) + малое снижение (40) + мало участников (20), '
-        'минус 25 за не наш профиль и минус 8 за регион вне НСО, Алтая, Кузбасса, Москвы/МО, Томска. '
+        'минус 25 за не наш профиль (в т.ч. просто ремонт дорог без моста/съезда/трубы/подпорной стены и работы '
+        '«по заявкам» без гарантированного объёма) и минус 8 за регион вне НСО, Алтая, Кузбасса, Москвы/МО, Томска. '
+        'Ручные поправки (✎) — в файле `analysis/contracts/corrections.csv`, пока их не внесли в таблицу. '
         'Ожидания берутся из истории заказчика и связки «направление × регион», при малой истории — '
         'подтягиваются к среднему по направлению. «Достоверность» показывает, сколько истории за баллом.',
         '',
