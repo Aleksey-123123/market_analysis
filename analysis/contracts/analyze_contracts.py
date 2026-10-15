@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import sys
 
+import numpy as np
 import pandas as pd
 
 COLS = ['date', 'tag', 'name', 'cust', 'price', 'adv', 'deadline', 'term',
@@ -295,9 +296,13 @@ def load_template(raw, cols):
         'participants': g('число участников').map(_num),
         'our_result': g('наш результат'),
         'decision': g('подаёмся?'),
+        'comment': g('комментарий / почему отклонили'),
         'regnum': g('реестровый номер').astype(str).str.strip(),
         'region': g('регион'),
     }).dropna(subset=['name'])
+    # «не наш профиль» в комментарии — то же, что «Подаёмся? = нет»
+    nope = df.comment.astype(str).str.contains('не наш профиль', case=False) & df.decision.isna()
+    df.loc[nope, 'decision'] = 'нет'
     df = apply_corrections(df)
     df['status'] = df.K.map(lambda s: TEMPLATE_STATUS.get(str(s).strip().lower(), 'не заполнено'))
     df['drop_pct'] = g('снижение, %').loc[df.index].map(_pct)
@@ -379,9 +384,9 @@ OFF_PROFILE = [
      r'ямочн|слоев износа|асфальтиров|асфальт\w* покрыти'),
     ('работы по заявкам, объём не гарантирован', 25,
      r'дорожно-мостового хозяйства|текущ\w* ремонт\w* и содержани|неопредел\w* объ[её]м|по заявкам'),
-    ('общестрой', 25, r'котельн|пристройк|ремонт\w* здани|строительств\w* здани|производственной базы|окон|двер|отделочн|кровл|фасад|текущ\w* ремонт\w* (помещени|здани)'),
+    ('общестрой', 25, r'общестроительн|котельн|пристройк|ремонт\w* здани|строительств\w* здани|производственной базы|окон|двер|отделочн|кровл|фасад|текущ\w* ремонт\w* (помещени|здани)'),
     ('зимнее содержание / снег', 25, r'зимн|снег|очистк\w* (автодорог|дорог)'),
-    ('видеонаблюдение / сигнализация / светофоры', 25, r'видеонаблюд|сигнализац|светофор|подсистем\w* безопасности|инженерно-технических средств|ИТСО'),
+    ('видеонаблюдение / сигнализация / светофоры', 25, r'видеонаблюд|сигнализац|светофор|подсистем\w* безопасности|инженерно-технических средств|ИТСО|транспортной безопасности|телекоммуникац'),
     ('детские площадки / МАФ', 25, r'детск\w* (игров\w* )?площадк|игров\w* (элемент|оборудован|комплекс)|малых архитектурных форм|\bМАФ'),
 ]
 # «Свои» регионы — без штрафа; остальные (Омск, Иркутск, Бурятия, Красноярск, Хакасия, Тюмень, Сургут…) — минус.
@@ -411,24 +416,53 @@ def profile_penalty(r):
     return pen, notes
 
 
-def _hist(g):
+# Свежие итоги важнее старых: вес итога падает вдвое каждые HALF_LIFE_DAYS дней.
+HALF_LIFE_DAYS = 30
+
+
+def _wmedian(v, w):
+    o = np.argsort(v)
+    v, w = np.asarray(v)[o], np.asarray(w)[o]
+    c = np.cumsum(w)
+    return float(v[np.searchsorted(c, c[-1] / 2)])
+
+
+def _hist(g, today=None):
+    if today is not None and HALF_LIFE_DAYS and len(g):
+        age = (today - g.deadline).dt.days.clip(lower=0).fillna(60)
+        w = 0.5 ** (age / HALF_LIFE_DAYS)
+    else:
+        w = pd.Series(1.0, index=g.index)
     z = g[g.status == 'заключен']
-    return {'n': len(g), 'n_drop': int(z.drop_pct.notna().sum()),
-            'n_part': int(g.participants.notna().sum()) if 'participants' in g else 0,
-            'fail': (g.status == 'не состоялась').mean() if len(g) else None,
-            'drop': z.drop_pct.median() if z.drop_pct.notna().any() else None,
-            'part': g.participants.median() if 'participants' in g and g.participants.notna().any() else None}
+    zd = z[z.drop_pct.notna()]
+    gp = g[g.participants.notna()] if 'participants' in g else g.iloc[0:0]
+    return {'cnt': len(g), 'n': float(w.sum()), 'n_drop': float(w[zd.index].sum()), 'n_part': float(w[gp.index].sum()),
+            'fail': float(np.average(g.status == 'не состоялась', weights=w)) if len(g) else None,
+            'drop': _wmedian(zd.drop_pct, w[zd.index]) if len(zd) else None,
+            'part': float(np.average(gp.participants, weights=w[gp.index])) if len(gp) else None}
+
+
+def _bid_drop(hist, r):
+    """Каким снижением выигрывали, когда торг был (≥2 участника): заказчик → направление×регион → направление."""
+    z = hist[(hist.status == 'заключен') & (hist.participants >= 2) & hist.drop_pct.notna()]
+    for sub, min_n, src in ((z[z.customer == r.customer], 3, 'заказчик'),
+                            (z[(z.direction == r.direction) & (z.region == r.region)], 4, 'направление в регионе'),
+                            (z[z.direction == r.direction], 4, 'направление')):
+        if len(sub) >= min_n:
+            q = sub.drop_pct.quantile([.25, .5, .75])
+            return f"{q[.25]:.0f}–{q[.75]:.0f}% (медиана {q[.5]:.0f}%)".replace('.', ','), src, len(sub)
+    return None, None, 0
 
 
 def open_tenders(df, today):
     """Открытые тендеры: история заказчика/сегмента, оценка конкуренции, флаги ограничений."""
-    hist = df[df.status.isin(['заключен', 'не состоялась'])]
+    hist = df[df.status.isin(['заключен', 'не состоялась']) & ~(df.deadline > today)]
     rows = []
     is_open = (df.deadline >= today) & ~df.status.isin(['отменена', 'заключен', 'не состоялась'])
     for _, r in df[is_open].iterrows():
-        hc = _hist(hist[hist.customer == r.customer])
-        hs = _hist(hist[(hist.direction == r.direction) & (hist.region == r.region)])
-        hd = _hist(hist[hist.direction == r.direction])
+        hc = _hist(hist[hist.customer == r.customer], today)
+        hs = _hist(hist[(hist.direction == r.direction) & (hist.region == r.region)], today)
+        hd = _hist(hist[hist.direction == r.direction], today)
         # Сглаживание: заказчик и сегмент весят по числу итогов, направление — как априорное (вес 5),
         # чтобы 2–3 итога не давали «100% несостоявшихся».
         def pick(key):
@@ -449,11 +483,13 @@ def open_tenders(df, today):
         pen, notes = profile_penalty(r)
         adv = _pct(r.adv) or 0
         bonus = ADVANCE_BONUS_HIGH if adv >= 30 else (ADVANCE_BONUS if adv > 0 else 0)
+        bid, bid_src, bid_n = _bid_drop(hist, r)
         rows.append({
+            'снижение при торге': bid, 'снижение: по чему': bid_src, 'снижение: n': bid_n,
             'балл': max(round(score - pen + bonus), 0), 'балл по истории': round(score),
             'аванс, %': adv or None,
             'не профиль': ', '.join(notes),
-            'достоверность': 'высокая' if hc['n'] >= 3 or hs['n'] >= 8 else ('средняя' if hc['n'] + hs['n'] >= 3 else 'низкая'),
+            'достоверность': 'высокая' if hc['cnt'] >= 3 or hs['cnt'] >= 8 else ('средняя' if hc['cnt'] + hs['cnt'] >= 3 else 'низкая'),
             'флаги': ', '.join(flags),
             'окончание подачи': r.deadline, 'наименование': r['name'], 'заказчик': r.customer,
             'регион': r.region, 'направление': r.direction, 'НМЦК, млн': round((r.nmck or 0) / 1e6, 1) or None,
@@ -461,10 +497,10 @@ def open_tenders(df, today):
             'ожид. доля несостоявшихся, %': None if fail is None else round(100 * fail),
             'ожид. снижение, %': None if drop is None else round(drop, 1),
             'ожид. участников': None if part is None else round(part, 1),
-            'заказчик: итогов': hc['n'],
+            'заказчик: итогов': hc['cnt'],
             'заказчик: не сост., %': None if hc['fail'] is None else round(100 * hc['fail']),
             'заказчик: мед. снижение, %': hc['drop'],
-            'сегмент: итогов': hs['n'],
+            'сегмент: итогов': hs['cnt'],
             'ссылка': r.gov, 'контур': r.kontur,
             'решение': str(r.get('decision') or '').strip().lower() if pd.notna(r.get('decision')) else '',
             'поправка': r.get('correction') if pd.notna(r.get('correction')) else '',
@@ -498,8 +534,8 @@ def _link(url, label):
 
 def _tender_table(o):
     """Полное название мелким шрифтом, ссылки на ЕИС и Контур отдельной колонкой."""
-    lines = ['| Балл | До | Тендер / заказчик | Регион | НМЦК, млн | Ожид. уч. / сниж. | Ссылки | Пометки |',
-             '|---|---|---|---|---|---|---|---|']
+    lines = ['| Балл | До | Тендер / заказчик | Регион | НМЦК, млн | Ожид. уч. | Снижение при торге | Ссылки | Пометки |',
+             '|---|---|---|---|---|---|---|---|---|']
     for _, r in o.iterrows():
         name = re.sub(r'\s+', ' ', str(r['наименование'])).strip().replace('|', '/')
         cust = _short(r['заказчик'], 70)
@@ -513,6 +549,9 @@ def _tender_table(o):
         if r['балл'] != r['балл по истории'] and not (has_adv and not r['не профиль']):
             score += f"<br><small>по истории {r['балл по истории']}</small>"
         links = ' · '.join(x for x in (_link(r['ссылка'], 'ЕИС'), _link(r['контур'], 'Контур')) if x)
+        bid = '—'
+        if r['снижение при торге']:
+            bid = f"{r['снижение при торге']}<br><small>по: {r['снижение: по чему']}, {r['снижение: n']} контр.</small>"
         marks = []
         if r['флаги']:
             marks.append('⚠ ' + r['флаги'])
@@ -522,7 +561,8 @@ def _tender_table(o):
             marks.append('✎ ' + r['поправка'])
         lines.append(
             f"| {score} | {r['окончание подачи']:%d.%m %H:%M} | {tender} | {REGION_SHORT.get(r['регион'], r['регион'])} | "
-            f"{_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} / {_fmt(r['ожид. снижение, %'], 0, '%')} | "
+            f"{_fmt(r['НМЦК, млн'], 1)} | {_fmt(r['ожид. участников'], 1)} | "
+            f"{bid} | "
             f"{links} | <small>{'<br>'.join(marks)}</small> |")
     return '\n'.join(lines)
 
@@ -611,6 +651,9 @@ def report_md(df, now, conclusions='', data_date=None):
         'минус 25 за не наш профиль (в т.ч. просто ремонт дорог без моста/съезда/трубы/подпорной стены и работы '
         '«по заявкам» без гарантированного объёма) и минус 8 за регион вне НСО, Алтая, Кузбасса, Москвы/МО, Томска. '
         'Ручные поправки (✎) — в файле `analysis/contracts/corrections.csv`, пока их не внесли в таблицу. '
+        'Свежие итоги весят больше (вес падает вдвое каждые 30 дней). '
+        '«Снижение при торге» — 25–75% диапазон снижения у победителей при 2+ участниках '
+        '(по заказчику, иначе по направлению в регионе, иначе по направлению). '
         'Ожидания берутся из истории заказчика и связки «направление × регион», при малой истории — '
         'подтягиваются к среднему по направлению. «Достоверность» показывает, сколько истории за баллом.',
         '',
