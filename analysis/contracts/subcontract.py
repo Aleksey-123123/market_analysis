@@ -3,6 +3,7 @@
 Запуск: python subcontract.py таблица.csv отчёт.md компании.csv [мин_НМЦК_млн] [выводы.md]
 """
 import re
+import os
 import sys
 
 import pandas as pd
@@ -251,6 +252,12 @@ if __name__ == '__main__':
     ideas = open(sys.argv[5], encoding='utf-8').read() if len(sys.argv) > 5 else ''
     big = load_big(src, min_mln)
     comp = companies_table(big)
+    # журнал рассылки ведётся вручную в outreach.csv рядом с companies.csv — подтягиваем статусы
+    log_path = os.path.join(os.path.dirname(csv), 'outreach.csv')
+    if os.path.exists(log_path):
+        log = pd.read_csv(log_path, dtype=str).fillna('').set_index('Компания')
+        for col, src_col in (('Статус контакта', 'Статус'), ('Email', 'Email'), ('Комментарий', 'Ответ')):
+            comp[col] = comp['Компания'].map(log[src_col]).fillna('')
     comp.to_csv(csv, index=False, encoding='utf-8-sig')
     with open(md, 'w', encoding='utf-8') as f:
         f.write(report(big, comp, min_mln, ac.load(src), ideas))
