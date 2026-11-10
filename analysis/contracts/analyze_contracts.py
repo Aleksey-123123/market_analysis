@@ -503,7 +503,7 @@ def open_tenders(df, today):
             'заказчик: не сост., %': None if hc['fail'] is None else round(100 * hc['fail']),
             'заказчик: мед. снижение, %': hc['drop'],
             'сегмент: итогов': hs['cnt'],
-            'ссылка': r.gov, 'контур': r.kontur,
+            'ссылка': r.gov, 'контур': r.kontur, 'regnum': r.regnum, 'адрес': r.get('addr'), 'закон': r.get('law'),
             'решение': str(r.get('decision') or '').strip().lower() if pd.notna(r.get('decision')) else '',
             'поправка': r.get('correction') if pd.notna(r.get('correction')) else '',
         })
